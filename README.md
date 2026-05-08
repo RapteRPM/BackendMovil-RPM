@@ -66,7 +66,13 @@ PORT=3000
 NODE_ENV=development
 
 # Frontend URLs (separadas por comas)
-FRONTEND_URLS=http://localhost:5500,http://127.0.0.1:5500
+FRONTEND_URLS=http://localhost:5173,http://localhost:5500,http://127.0.0.1:5500
+
+# Acceso desde Android Studio / red local
+API_HOST=0.0.0.0
+SESSION_COOKIE_SECURE=false
+SESSION_COOKIE_SAMESITE=lax
+TRUST_PROXY=false
 ```
 
 ### 4️⃣ Importar base de datos
@@ -199,12 +205,13 @@ Ver documentación completa en [README-BACKEND.md](README-BACKEND.md)
 ## 🌐 CORS y Frontend
 
 El backend está configurado para aceptar peticiones desde:
+- `http://localhost:5173` (Vite / React)
 - `http://localhost:5500` (Live Server)
 - `http://127.0.0.1:5500`
 
 Para agregar más orígenes, edita el archivo `.env`:
 ```env
-FRONTEND_URLS=http://localhost:5500,https://tu-frontend.com
+FRONTEND_URLS=http://localhost:5173,http://localhost:5500,https://tu-frontend.com
 ```
 
 **Importante:** El frontend debe enviar `credentials: 'include'` en todas las peticiones para mantener la sesión:
@@ -216,6 +223,25 @@ fetch('http://localhost:3000/api/login', {
   body: JSON.stringify({ usuario, password })
 })
 ```
+
+## 📱 Acceso desde Android
+
+### Emulador de Android Studio
+Usa esta URL base en tu app móvil:
+```text
+http://10.0.2.2:3000
+```
+
+### Teléfono físico
+Usa la IP local de tu PC:
+```text
+http://192.168.x.x:3000
+```
+
+### Recomendaciones
+- Asegúrate de que el backend esté ejecutándose con `API_HOST=0.0.0.0`.
+- Revisa que el firewall de Windows permita el puerto `3000`.
+- Si tu app móvil usa cookies/sesiones, conserva las mismas credenciales y reutiliza la base URL correcta.
 
 ---
 

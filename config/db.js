@@ -1,5 +1,5 @@
+import 'dotenv/config';
 import mysql from 'mysql2/promise';
-import Database from 'better-sqlite3';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -10,6 +10,7 @@ const __dirname = path.dirname(__filename);
 let usarSQLite = false;
 let sqliteDb = null;
 let mysqlPool = null;
+let Database = null;
 
 // Detectar si estamos en modo desarrollo o producción
 const isProduction = process.env.NODE_ENV === 'production';
@@ -109,6 +110,16 @@ const restaurarDatosVacios = (db) => {
   }
 };
 
+const cargarDatabaseSQLite = async () => {
+  if (Database) {
+    return Database;
+  }
+
+  const modulo = await import('better-sqlite3');
+  Database = modulo.default;
+  return Database;
+};
+
 // Intentar conectar a MySQL primero
 try {
   mysqlPool = mysql.createPool({
@@ -142,10 +153,15 @@ try {
   usarSQLite = true;
   
   // Crear base de datos SQLite
-  const dbPath = path.join(__dirname, '../rpm_market.db');
-  sqliteDb = new Database(dbPath);
-  
-  console.log('✅ Base de datos SQLite creada en:', dbPath);
+  try {
+    const SQLiteDatabase = await cargarDatabaseSQLite();
+    const dbPath = path.join(__dirname, '../rpm_market.db');
+    sqliteDb = new SQLiteDatabase(dbPath);
+    console.log('✅ Base de datos SQLite creada en:', dbPath);
+  } catch (sqliteLoadErr) {
+    console.error('❌ No se pudo cargar better-sqlite3 para el fallback SQLite:', sqliteLoadErr.message);
+    throw new Error('No se pudo iniciar MySQL ni SQLite. Revisa la conexión a MySQL o reinstala better-sqlite3.');
+  }
   
   // Leer y ejecutar el script SQL si la BD está vacía
   try {

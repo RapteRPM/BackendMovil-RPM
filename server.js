@@ -18,25 +18,50 @@ import { crearCredenciales } from './controllers/credenciales.js';
 import crypto from 'crypto'; // Para generar tokens seguros
 import enviarCorreo from './controllers/enviarCorreo.js';
 import bcrypt from 'bcrypt'; // Para hashear contraseñas
+import os from 'os';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
 const app = express();
 const port = process.env.PORT || 3000;
+const host = process.env.API_HOST || '0.0.0.0';
+
+const parseCsvEnv = (value, fallback = []) => {
+  if (!value) return fallback;
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+};
+
+const defaultOrigins = [
+  'http://localhost:3000',
+  'http://127.0.0.1:3000',
+  'http://localhost:5500',
+  'http://127.0.0.1:5500',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+  'http://localhost:4200',
+  'http://127.0.0.1:4200',
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+  'http://10.0.2.2:3000',
+  'http://10.0.2.2:5500'
+];
+
+const allowedOrigins = Array.from(
+  new Set([
+    ...parseCsvEnv(process.env.FRONTEND_URLS),
+    ...parseCsvEnv(process.env.WEB_FRONTEND_URLS),
+    ...parseCsvEnv(process.env.MOBILE_FRONTEND_URLS),
+    ...defaultOrigins
+  ])
+);
 
 // ===============================
 // 🌐 Configuración de CORS
 // ===============================
-// Obtener URLs del frontend desde variables de entorno o usar valores por defecto
-const allowedOrigins = process.env.FRONTEND_URLS 
-  ? process.env.FRONTEND_URLS.split(',')
-  : [
-      'http://localhost:5500',
-      'http://127.0.0.1:5500',
-      'http://localhost:5501',
-      'http://127.0.0.1:5501'
-    ];
 
 const corsOptions = {
   origin: function (origin, callback) {
@@ -85,13 +110,17 @@ app.use(
     saveUninitialized: false,
     cookie: {
       httpOnly: true,
-      secure: false, // Cambiar a true en producción con HTTPS
-      sameSite: 'lax',
+      secure: process.env.SESSION_COOKIE_SECURE === 'true',
+      sameSite: process.env.SESSION_COOKIE_SAMESITE || 'lax',
       path: '/',
       maxAge: 24 * 60 * 60 * 1000 // 24 horas
     },
   })
 );
+
+if (process.env.TRUST_PROXY === 'true') {
+  app.set('trust proxy', 1);
+}
 
 // Configuración general
 app.use("/api/privado", verificarSesion); 
@@ -205,7 +234,7 @@ app.get('/', (req, res) => {
     },
     cors: {
       habilitado: true,
-      origenes: ['http://localhost:5500', 'http://127.0.0.1:5500']
+      origenes: allowedOrigins
     },
     documentacion: {
       backend: 'README-BACKEND.md',
@@ -222,11 +251,11 @@ app.get('/', (req, res) => {
 app.post('/api/login/demo', (req, res) => {
   const { username, password } = req.body;
   
-  // Usuarios de demo
+  // Usuarios de demo (usando IDs reales de la BD)
   const usuariosDemo = {
-    'usuario1': { password: '123456', tipo: 'Natural', id: 1001, nombre: 'Juan Usuario' },
-    'comerciante1': { password: '123456', tipo: 'Comerciante', id: 2001, nombre: 'Tienda ABC' },
-    'prestador1': { password: '123456', tipo: 'PrestadorServicio', id: 3001, nombre: 'Grúa Express' }
+    'usuario1': { password: '123456', tipo: 'Natural', id: 71001, nombre: 'Daniel' },
+    'comerciante1': { password: '123456', tipo: 'Comerciante', id: 72001, nombre: 'Motor Plus' },
+    'prestador1': { password: '123456', tipo: 'PrestadorServicio', id: 73001, nombre: 'Grúa Express' }
   };
   
   const usuario = usuariosDemo[username];
@@ -260,10 +289,21 @@ app.post('/api/login/demo', (req, res) => {
 // ===============================
 app.post('/api/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const body = req.body || {};
+    const username = body.username || body.email || body.correo || body.nombreUsuario;
+    const password = body.password || body.contrasena;
+
+    console.log('🔐 Login body recibido:', {
+      keys: Object.keys(body),
+      tieneUsuario: Boolean(username),
+      tienePassword: Boolean(password)
+    });
 
     if (!username || !password) {
-      return res.status(400).json({ error: "Faltan datos" });
+      return res.status(400).json({
+        error: "Faltan datos",
+        esperado: ["username o email", "password"]
+      });
     }
 
     const query = `
@@ -367,11 +407,10 @@ app.get('/api/usuario-actual', verificarSesion, async (req, res) => {
   }
 
   try {
-    // 🔍 Obtenemos los datos del usuario
+    // 🔍 Obtenemos los datos del usuario (sin dependencia de credenciales)
     const userRows = await queryPromise(
       `SELECT u.IdUsuario, u.TipoUsuario, u.Nombre, u.Apellido, u.Documento, u.FotoPerfil
        FROM usuario u
-       INNER JOIN credenciales c ON c.Usuario = u.IdUsuario
        WHERE u.IdUsuario = ?`,
       [usuarioSesion.id]
     );
@@ -623,11 +662,20 @@ app.get('/api/verificar-sesion', (req, res) => {
 // ===============================
 // 🏁 Iniciar servidor
 // ===============================
-app.listen(port, () => {
-  console.log(`🚀 Backend API escuchando en: http://localhost:${port}`);
-  console.log(`📡 CORS habilitado para: localhost:5500 + GitHub Codespaces`);
-  console.log(`🔍 Health check: http://localhost:${port}/health`);
-  console.log(`🗄️ DB Status: http://localhost:${port}/api/db-status`);
+app.listen(port, host, () => {
+  console.log(`🚀 Backend API escuchando en: http://${host}:${port}`);
+  console.log(`📡 CORS habilitado para ${allowedOrigins.length} origenes configurados`);
+  console.log(`🔍 Health check: http://${host}:${port}/health`);
+  console.log(`🗄️ DB Status: http://${host}:${port}/api/db-status`);
+  console.log(`📱 Para Android emulador usa: http://10.0.2.2:${port}`);
+  const interfaces = os.networkInterfaces();
+  Object.entries(interfaces).forEach(([name, entries]) => {
+    entries?.forEach((entry) => {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        console.log(`🌐 ${name}: http://${entry.address}:${port}`);
+      }
+    });
+  });
 });
 
 // ----------------------
@@ -649,20 +697,15 @@ app.get('/api/historial', async (req, res) => {
         f.FechaCompra AS fecha,
         df.Total AS precio,
         COALESCE(f.MetodoPago, 'Sin registro') AS metodoPago,
-        CASE
-          WHEN df.Estado = 'Finalizado' THEN 'Finalizado'
-          WHEN df.Estado = 'Cancelado' THEN 'Cancelado'
-          WHEN df.Estado = 'Pendiente' THEN 'Pendiente'
-          ELSE df.Estado
-        END AS estado,
+        COALESCE(f.Estado, df.Estado) AS estado,
         f.IdFactura AS idFactura,
         'producto' AS tipo,
-        ca.FechaServicio AS fechaEntrega,
-        ca.HoraServicio AS horaEntrega,
-        ca.ModoServicio AS modoEntrega,
-        ca.FechaModificadaPor AS fechaModificada,
-        ca.NotificacionVista AS notificacionVista,
-        ca.IdSolicitud AS idSolicitudComercio,
+        COALESCE(ca.FechaServicio, NULL) AS fechaEntrega,
+        COALESCE(ca.HoraServicio, NULL) AS horaEntrega,
+        COALESCE(ca.ModoServicio, NULL) AS modoEntrega,
+        NULL AS fechaModificada,
+        NULL AS notificacionVista,
+        COALESCE(ca.IdSolicitud, NULL) AS idSolicitudComercio,
         uc.Telefono AS telefonoComercio,
         com.NombreComercio AS nombreComercio
       FROM detallefactura df
