@@ -1,4 +1,4 @@
-USE rpm_market;
+USE rpmmarket;
 START TRANSACTION;
 
 INSERT INTO categoria (IdCategoria, NombreCategoria) VALUES

@@ -1,4 +1,4 @@
-USE rpm_market;
+USE rpmmarket;
 
 CREATE TABLE usuario (
   IdUsuario INT PRIMARY KEY,

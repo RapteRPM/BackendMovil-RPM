@@ -1,7 +1,7 @@
 // ===============================
 // 📦 Importaciones
 // ===============================
-import { verificarSesion, evitarCache } from './middlewares/sesion.js';
+import { verificarSesion, verificarAdmin, evitarCache } from './middlewares/sesion.js';
 import { fileURLToPath } from 'url';
 import { dirname } from 'path';
 import express from 'express';
@@ -93,13 +93,6 @@ const corsOptions = {
 
 app.use(cors(corsOptions));
 
-// Log para debugging CORS
-app.use((req, res, next) => {
-  const origin = req.headers.origin || 'sin origin';
-  console.log(`📨 ${req.method} ${req.path} - Origin: ${origin}`);
-  next();
-});
-
 // ===============================
 // 🔐 Configuración de sesiones
 // ===============================
@@ -123,8 +116,25 @@ if (process.env.TRUST_PROXY === 'true') {
 }
 
 // Configuración general
-app.use("/api/privado", verificarSesion); 
+app.use("/api/privado", verificarSesion);
 app.use(express.json());
+
+const tempDir = path.join(process.cwd(), 'public', 'imagen', 'temp');
+fs.mkdirSync(tempDir, { recursive: true });
+
+const storagePublicacion = multer.diskStorage({
+  destination: (req, file, cb) => cb(null, tempDir),
+  filename: (req, file, cb) => {
+    const nombreUnico =
+      Date.now() + '-' + Math.round(Math.random() * 1e9) + path.extname(file.originalname);
+    cb(null, nombreUnico);
+  }
+});
+
+const uploadPublicacion = multer({
+  storage: storagePublicacion,
+  limits: { fileSize: 5 * 1024 * 1024 }
+});
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 
@@ -287,8 +297,16 @@ app.post('/api/login/demo', (req, res) => {
 // ===============================
 // 🔑 Login
 // ===============================
-app.post('/api/login', async (req, res) => {
-  try {
+// ===============================
+// 🔐 Ruta de Inicio de Sesión
+// ===============================
+app.post('/api/login', (req, res, next) => {
+  console.log('✅ /api/login endpoint fue llamado');
+  console.log('Body recibido:', req.body);
+  
+  // Continuar con la lógica async
+  (async () => {
+    try {
     const body = req.body || {};
     const username = body.username || body.email || body.correo || body.nombreUsuario;
     const password = body.password || body.contrasena;
@@ -366,10 +384,14 @@ app.post('/api/login', async (req, res) => {
     console.log("🔍 Session ID creado:", req.sessionID);
     
     // Forzar el guardado de la sesión antes de responder
-    req.session.save((err) => {
-      if (err) {
-        console.error("❌ Error al guardar sesión:", err);
-        return res.status(500).json({ error: "Error al crear sesión" });
+    req.session.save((saveErr) => {
+      if (saveErr) {
+        console.error("❌ Error al guardar sesión:", saveErr.message);
+        console.error("Stack:", saveErr.stack);
+        return res.status(500).json({ 
+          error: "Error al crear sesión",
+          details: saveErr.message
+        });
       }
       
       console.log("✅ Sesión guardada correctamente");
@@ -391,9 +413,11 @@ app.post('/api/login', async (req, res) => {
     });
 
   } catch (err) {
-    console.error("❌ Error en la consulta SQL:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
+    console.error("❌ Error en la consulta SQL:", err.message);
+    console.error("Stack:", err.stack);
+    res.status(500).json({ error: "Error interno del servidor", details: err.message });
   }
+  })();
 });
 
 
@@ -656,6 +680,162 @@ app.get('/api/verificar-sesion', (req, res) => {
   } else {
     console.log("⚠️ [verificar-sesion] No hay sesión activa");
     res.json({ activa: false });
+  }
+});
+
+// ===============================
+// 📊 Dashboard - métricas para el usuario en sesión
+// ===============================
+app.get('/api/dashboard', verificarSesion, async (req, res) => {
+  const usuarioSesion = req.session.usuario;
+  if (!usuarioSesion) return res.status(401).json({ error: 'No autorizado' });
+
+  const { from, to, state } = req.query; // opcionales: from=YYYY-MM-DD, to=YYYY-MM-DD, state=pendiente|completado|all
+
+  try {
+    const userRows = await queryPromise('SELECT IdUsuario, TipoUsuario, Correo FROM usuario WHERE IdUsuario = ?', [usuarioSesion.id]);
+    if (!userRows || userRows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+
+    const user = userRows[0];
+    const email = user.Correo || null;
+
+    // Soportamos principalmente PrestadorServicio (servicios de grúa)
+    if (user.TipoUsuario === 'PrestadorServicio') {
+      // Obtener los IdServicio vinculados al usuario
+      const servicioRows = await queryPromise('SELECT IdServicio FROM prestadorservicio WHERE Usuario = ?', [usuarioSesion.id]);
+      if (!servicioRows || servicioRows.length === 0) {
+        return res.json({ email, totalServices: 0, pending: 0, completed: 0, rating: 0.0, period: { from: from || null, to: to || null } });
+      }
+
+      const servicioIds = servicioRows.map(r => r.IdServicio);
+      const placeholders = servicioIds.map(() => '?').join(',');
+
+      // Construir filtros de fecha y estado
+      let dateFilter = '';
+      const paramsBase = [...servicioIds];
+      if (from && to) {
+        dateFilter = ' AND c.FechaServicio BETWEEN ? AND ?';
+        paramsBase.push(from, to);
+      }
+
+      let stateFilter = '';
+      if (state && state.toLowerCase() === 'pendiente') stateFilter = " AND c.Estado = 'Pendiente'";
+      if (state && (state.toLowerCase() === 'completado' || state.toLowerCase() === 'finalizado')) stateFilter = " AND c.Estado = 'Finalizado'";
+
+      // Total servicios
+      const totalQuery = `SELECT COUNT(*) AS total FROM controlagendaservicios c INNER JOIN publicaciongrua pg ON c.PublicacionGrua = pg.IdPublicacionGrua WHERE pg.Servicio IN (${placeholders}) ${dateFilter}`;
+      const totalRows = await queryPromise(totalQuery, paramsBase.slice(0, servicioIds.length + (from && to ? 2 : 0)));
+      const totalServices = totalRows && totalRows.length ? totalRows[0].total : 0;
+
+      // Pendientes
+      const pendingQuery = `SELECT COUNT(*) AS pending FROM controlagendaservicios c INNER JOIN publicaciongrua pg ON c.PublicacionGrua = pg.IdPublicacionGrua WHERE pg.Servicio IN (${placeholders}) ${stateFilter ? stateFilter : " AND c.Estado = 'Pendiente'"} ${dateFilter}`;
+      const pendingRows = await queryPromise(pendingQuery, paramsBase.slice(0, servicioIds.length + (from && to ? 2 : 0)));
+      const pending = pendingRows && pendingRows.length ? pendingRows[0].pending : 0;
+
+      // Completados
+      const completedQuery = `SELECT COUNT(*) AS completed FROM controlagendaservicios c INNER JOIN publicaciongrua pg ON c.PublicacionGrua = pg.IdPublicacionGrua WHERE pg.Servicio IN (${placeholders}) AND c.Estado = 'Finalizado' ${dateFilter}`;
+      const completedRows = await queryPromise(completedQuery, paramsBase.slice(0, servicioIds.length + (from && to ? 2 : 0)));
+      const completed = completedRows && completedRows.length ? completedRows[0].completed : 0;
+
+      // Valoración promedio (OpinionesGrua.Calificacion)
+      const ratingQuery = `SELECT AVG(og.Calificacion) AS rating FROM OpinionesGrua og INNER JOIN publicaciongrua pg ON og.PublicacionGrua = pg.IdPublicacionGrua WHERE pg.Servicio IN (${placeholders})`;
+      const ratingRows = await queryPromise(ratingQuery, servicioIds);
+      const rating = ratingRows && ratingRows.length && ratingRows[0].rating ? Number(parseFloat(ratingRows[0].rating).toFixed(1)) : 0.0;
+
+      return res.json({ email, totalServices, pending, completed, rating, period: { from: from || null, to: to || null } });
+    }
+
+    // Fallback para otros tipos de usuario: devolver métricas básicas (publicaciones, compras, valoraciones generales)
+    // Total publicaciones (comerciantes)
+    if (user.TipoUsuario === 'Comerciante') {
+      const publicacionesRows = await queryPromise('SELECT COUNT(*) AS total FROM publicacion WHERE Comerciante = (SELECT NitComercio FROM comerciante WHERE Comercio = ?)', [usuarioSesion.id]);
+      const totalServices = publicacionesRows && publicacionesRows.length ? publicacionesRows[0].total : 0;
+      return res.json({ email, totalServices, pending: 0, completed: 0, rating: 0.0, period: { from: from || null, to: to || null } });
+    }
+
+    // Usuario natural u otros
+    return res.json({ email, totalServices: 0, pending: 0, completed: 0, rating: 0.0, period: { from: from || null, to: to || null } });
+  } catch (err) {
+    console.error('❌ Error obteniendo dashboard:', err);
+    res.status(500).json({ error: 'Error interno al obtener métricas' });
+  }
+});
+
+// ===============================
+// 📋 Últimas solicitudes de grúa para el dashboard
+// ===============================
+app.get('/api/dashboard/ultimas-solicitudes-grua', verificarSesion, async (req, res) => {
+  const usuarioSesion = req.session.usuario;
+  if (!usuarioSesion) return res.status(401).json({ error: 'No autorizado' });
+
+  const limit = Math.min(Math.max(parseInt(req.query.limit || '5', 10) || 5, 1), 20);
+
+  try {
+    const servicioRows = await queryPromise(
+      'SELECT IdServicio FROM prestadorservicio WHERE Usuario = ?',
+      [usuarioSesion.id]
+    );
+
+    if (!servicioRows || servicioRows.length === 0) {
+      return res.json({ items: [], limit });
+    }
+
+    const servicioIds = servicioRows.map((row) => row.IdServicio);
+    const placeholders = servicioIds.map(() => '?').join(',');
+
+    const rows = await queryPromise(
+      `SELECT
+        c.IdSolicitudServicio AS idSolicitud,
+        TRIM(CONCAT(u.Nombre, ' ', COALESCE(u.Apellido, ''))) AS nombreCliente,
+        c.DireccionRecogida AS origen,
+        c.Destino AS destino,
+        CONCAT(DATE_FORMAT(c.FechaServicio, '%d/%m/%Y')) AS fecha,
+        TIME_FORMAT(c.HoraServicio, '%H:%i') AS hora,
+        CONCAT(DATE_FORMAT(c.FechaServicio, '%d/%m/%Y'), ' ', TIME_FORMAT(c.HoraServicio, '%H:%i')) AS fechaCompleta,
+        c.Estado AS estado
+      FROM controlagendaservicios c
+      INNER JOIN publicaciongrua pg ON pg.IdPublicacionGrua = c.PublicacionGrua
+      INNER JOIN usuario u ON u.IdUsuario = c.UsuarioNatural
+      WHERE pg.Servicio IN (${placeholders})
+      ORDER BY c.FechaServicio DESC, c.HoraServicio DESC, c.IdSolicitudServicio DESC
+      LIMIT ?`,
+      [...servicioIds, limit]
+    );
+
+    return res.json({
+      items: rows.map((row) => ({
+        idSolicitud: row.idSolicitud,
+        nombreCliente: row.nombreCliente || '',
+        origen: row.origen || '',
+        destino: row.destino || '',
+        fecha: row.fecha || null,
+        hora: row.hora || null,
+        fechaCompleta: row.fechaCompleta || null,
+        estado: row.estado || 'Pendiente'
+      })),
+      limit
+    });
+  } catch (err) {
+    console.error('❌ Error obteniendo últimas solicitudes de grúa:', err);
+    res.status(500).json({ error: 'Error interno al obtener solicitudes recientes' });
+  }
+});
+
+// ===============================
+// 📊 Dashboard por usuario (Admin)
+// ===============================
+app.get('/api/usuarios/:id/dashboard', verificarAdmin, async (req, res) => {
+  const { id } = req.params;
+  try {
+    const userRows = await queryPromise('SELECT IdUsuario, TipoUsuario, Correo FROM usuario WHERE IdUsuario = ?', [id]);
+    if (!userRows || userRows.length === 0) return res.status(404).json({ error: 'Usuario no encontrado' });
+    // Reusar la lógica: simular sesión temporal
+    req.session.usuario = { id: id };
+    // Delegar a /api/dashboard
+    return app._router.handle(req, res, () => {});
+  } catch (err) {
+    console.error('❌ Error dashboard admin:', err);
+    res.status(500).json({ error: 'Error interno al obtener métricas' });
   }
 });
 
@@ -1415,14 +1595,695 @@ app.get('/api/talleres', async (req, res) => {
   }
 });
 
+// ===============================
+// 📋 CONSULTAS DIRECTAS DE GRÚAS Y SOPORTE
+// ===============================
+
+app.get('/api/publicaciongrua', async (req, res) => {
+  const { idPublicacionGrua, servicio } = req.query;
+
+  try {
+    let query = `
+      SELECT
+        pg.IdPublicacionGrua,
+        pg.Servicio,
+        pg.DescripcionServicio,
+        pg.TarifaBase,
+        pg.ZonaCobertura,
+        pg.FotoPublicacion,
+        pg.TituloPublicacion,
+        ps.usuario AS IdPrestador,
+        CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS NombrePrestador,
+        u.Correo AS CorreoPrestador
+      FROM publicaciongrua pg
+      INNER JOIN prestadorservicio ps ON pg.Servicio = ps.IdServicio
+      LEFT JOIN usuario u ON ps.usuario = u.IdUsuario
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    if (idPublicacionGrua) {
+      query += ' AND pg.IdPublicacionGrua = ?';
+      params.push(idPublicacionGrua);
+    }
+
+    if (servicio) {
+      query += ' AND pg.Servicio = ?';
+      params.push(servicio);
+    }
+
+    query += ' ORDER BY pg.IdPublicacionGrua DESC';
+
+    const [rows] = await pool.query(query, params);
+    res.json({ success: true, total: rows.length, publicaciones: rows });
+  } catch (error) {
+    console.error('❌ Error consultando publicaciongrua:', error);
+    res.status(500).json({ success: false, message: 'Error al consultar publicaciongrua' });
+  }
+});
+
+// ===============================
+// 📤 CREAR PUBLICACIÓN DE GRÚA - PRESTADOR DE SERVICIO
+// ===============================
+app.post('/api/publicaciongrua', uploadPublicacion.single('fotoPublicacion'), async (req, res) => {
+  const usuario = req.session.usuario;
+
+  if (!usuario || usuario.tipo !== 'PrestadorServicio') {
+    if (req.file) {
+      cleanupTempFiles([req.file], tempDir);
+    }
+    return res.status(403).json({ error: 'Acceso no autorizado. Solo prestadores pueden publicar.' });
+  }
+
+  const { titulo, descripcion, tarifa, zona } = req.body;
+
+  if (!titulo || !descripcion || !tarifa) {
+    if (req.file) {
+      cleanupTempFiles([req.file], tempDir);
+    }
+    return res.status(400).json({ error: 'Faltan campos obligatorios: titulo, descripcion, tarifa.' });
+  }
+
+  if (!req.file) {
+    return res.status(400).json({ error: 'Debes subir una imagen para la publicación.' });
+  }
+
+  try {
+    // Obtener IdServicio del prestador
+    const [servRows] = await pool.query('SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1', [usuario.id]);
+    if (servRows.length === 0) {
+      cleanupTempFiles([req.file], tempDir);
+      return res.status(400).json({ error: 'No se encontró registro de prestador para este usuario.' });
+    }
+
+    const idServicio = servRows[0].IdServicio;
+
+    // Insertar publicación (sin foto)
+    const [result] = await pool.query(
+      `INSERT INTO publicaciongrua (Servicio, TituloPublicacion, DescripcionServicio, TarifaBase, ZonaCobertura, FotoPublicacion)
+       VALUES (?, ?, ?, ?, ?, '')`,
+      [idServicio, titulo, descripcion, tarifa, zona || null]
+    );
+
+    const idPublicacion = result.insertId;
+
+    const carpetaPublicacion = path.join(
+      process.cwd(),
+      'public',
+      'imagen',
+      'PrestadorServicios',
+      usuario.id.toString(),
+      'publicaciones',
+      idPublicacion.toString()
+    );
+    fs.mkdirSync(carpetaPublicacion, { recursive: true });
+
+    const destinoImagen = path.join(carpetaPublicacion, req.file.filename);
+    fs.renameSync(req.file.path, destinoImagen);
+
+    const fotoRutaFinal = path.join(
+      'imagen',
+      'PrestadorServicios',
+      usuario.id.toString(),
+      'publicaciones',
+      idPublicacion.toString(),
+      req.file.filename
+    ).replace(/\\/g, '/');
+
+    await pool.query('UPDATE publicaciongrua SET FotoPublicacion = ? WHERE IdPublicacionGrua = ?', [fotoRutaFinal, idPublicacion]);
+
+    res.json({ success: true, message: 'Publicación de grúa creada con imagen', idPublicacion, foto: fotoRutaFinal });
+  } catch (err) {
+    if (req.file) {
+      cleanupTempFiles([req.file], tempDir);
+    }
+    console.error('❌ Error creando publicaciongrua:', err);
+    res.status(500).json({ success: false, message: 'Error al crear publicaciongrua' });
+  }
+});
+
+// ===============================
+// ✏️ EDITAR PUBLICACIÓN DE GRÚA - PRESTADOR DE SERVICIO
+// ===============================
+app.put('/api/publicaciongrua/:id', uploadPublicacion.single('fotoPublicacion'), async (req, res) => {
+  const usuario = req.session.usuario;
+  const idPublicacion = req.params.id;
+
+  if (!usuario || usuario.tipo !== 'PrestadorServicio') {
+    if (req.file) {
+      cleanupTempFiles([req.file], tempDir);
+    }
+    return res.status(403).json({ error: 'Acceso no autorizado. Solo prestadores pueden editar publicaciones.' });
+  }
+
+  try {
+    const [servRows] = await pool.query(
+      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1',
+      [usuario.id]
+    );
+
+    if (servRows.length === 0) {
+      if (req.file) {
+        cleanupTempFiles([req.file], tempDir);
+      }
+      return res.status(404).json({ error: 'No se encontró registro de prestador para este usuario.' });
+    }
+
+    const idServicio = servRows[0].IdServicio;
+
+    const [pubRows] = await pool.query(
+      `SELECT IdPublicacionGrua, TituloPublicacion, DescripcionServicio, TarifaBase, ZonaCobertura, FotoPublicacion
+       FROM publicaciongrua
+       WHERE IdPublicacionGrua = ? AND Servicio = ?
+       LIMIT 1`,
+      [idPublicacion, idServicio]
+    );
+
+    if (pubRows.length === 0) {
+      if (req.file) {
+        cleanupTempFiles([req.file], tempDir);
+      }
+      return res.status(404).json({ error: 'Publicación de grúa no encontrada o no te pertenece.' });
+    }
+
+    const actual = pubRows[0];
+    const titulo = (req.body.titulo ?? actual.TituloPublicacion)?.toString().trim();
+    const descripcion = (req.body.descripcion ?? actual.DescripcionServicio)?.toString().trim();
+    const tarifa = req.body.tarifa ?? actual.TarifaBase;
+    const zona = req.body.zona !== undefined
+      ? (req.body.zona === '' ? null : req.body.zona)
+      : actual.ZonaCobertura;
+
+    if (!titulo || !descripcion || tarifa === undefined || tarifa === null || tarifa === '') {
+      if (req.file) {
+        cleanupTempFiles([req.file], tempDir);
+      }
+      return res.status(400).json({ error: 'Campos inválidos. Debes enviar titulo, descripcion y tarifa válidos.' });
+    }
+
+    let fotoRutaFinal = actual.FotoPublicacion;
+
+    if (req.file) {
+      const carpetaPublicacion = path.join(
+        process.cwd(),
+        'public',
+        'imagen',
+        'PrestadorServicios',
+        usuario.id.toString(),
+        'publicaciones',
+        idPublicacion.toString()
+      );
+      fs.mkdirSync(carpetaPublicacion, { recursive: true });
+
+      const destinoImagen = path.join(carpetaPublicacion, req.file.filename);
+      fs.renameSync(req.file.path, destinoImagen);
+
+      fotoRutaFinal = path
+        .join('imagen', 'PrestadorServicios', usuario.id.toString(), 'publicaciones', idPublicacion.toString(), req.file.filename)
+        .replace(/\\/g, '/');
+
+      if (actual.FotoPublicacion) {
+        const fotoAnterior = actual.FotoPublicacion.replace(/^\/+/, '');
+        const rutaFotoAnterior = path.join(process.cwd(), 'public', fotoAnterior);
+        if (fs.existsSync(rutaFotoAnterior)) {
+          fs.unlinkSync(rutaFotoAnterior);
+        }
+      }
+    }
+
+    await pool.query(
+      `UPDATE publicaciongrua
+       SET TituloPublicacion = ?, DescripcionServicio = ?, TarifaBase = ?, ZonaCobertura = ?, FotoPublicacion = ?
+       WHERE IdPublicacionGrua = ? AND Servicio = ?`,
+      [titulo, descripcion, tarifa, zona, fotoRutaFinal, idPublicacion, idServicio]
+    );
+
+    res.json({
+      success: true,
+      message: 'Publicación de grúa actualizada correctamente',
+      data: {
+        idPublicacion: Number(idPublicacion),
+        titulo,
+        descripcion,
+        tarifa,
+        zona,
+        foto: fotoRutaFinal,
+      },
+    });
+  } catch (err) {
+    if (req.file) {
+      cleanupTempFiles([req.file], tempDir);
+    }
+    console.error('❌ Error actualizando publicaciongrua:', err);
+    res.status(500).json({ success: false, message: 'Error al actualizar publicaciongrua' });
+  }
+});
+
+// ===============================
+// 🗑️ ELIMINAR PUBLICACIÓN DE GRÚA - PRESTADOR DE SERVICIO
+// ===============================
+app.delete('/api/publicaciongrua/:id', async (req, res) => {
+  const usuario = req.session.usuario;
+  const idPublicacion = req.params.id;
+
+  if (!usuario || usuario.tipo !== 'PrestadorServicio') {
+    return res.status(403).json({ error: 'Acceso no autorizado. Solo prestadores pueden eliminar publicaciones.' });
+  }
+
+  try {
+    const [servRows] = await pool.query(
+      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1',
+      [usuario.id]
+    );
+
+    if (servRows.length === 0) {
+      return res.status(404).json({ error: 'No se encontró registro de prestador para este usuario.' });
+    }
+
+    const idServicio = servRows[0].IdServicio;
+
+    const [pubRows] = await pool.query(
+      `SELECT IdPublicacionGrua, FotoPublicacion
+       FROM publicaciongrua
+       WHERE IdPublicacionGrua = ? AND Servicio = ?
+       LIMIT 1`,
+      [idPublicacion, idServicio]
+    );
+
+    if (pubRows.length === 0) {
+      return res.status(404).json({ error: 'Publicación de grúa no encontrada o no te pertenece.' });
+    }
+
+    const pub = pubRows[0];
+
+    // Eliminar foto si existe
+    if (pub.FotoPublicacion) {
+      const fotoAnterior = pub.FotoPublicacion.replace(/^\/+/, '');
+      const rutaFotoAnterior = path.join(process.cwd(), 'public', fotoAnterior);
+      if (fs.existsSync(rutaFotoAnterior)) {
+        fs.unlinkSync(rutaFotoAnterior);
+      }
+    }
+
+    // Eliminar historial asociado a las solicitudes de esta publicación (evita FK error)
+    await pool.query(
+      `DELETE hs FROM historialservicios hs
+       JOIN controlagendaservicios cas ON hs.SolicitudServicio = cas.IdSolicitudServicio
+       WHERE cas.PublicacionGrua = ?`,
+      [idPublicacion]
+    );
+
+    // Eliminar solicitudes relacionadas
+    await pool.query('DELETE FROM controlagendaservicios WHERE PublicacionGrua = ?', [idPublicacion]);
+
+    // Eliminar opiniones
+    await pool.query('DELETE FROM OpinionesGrua WHERE PublicacionGrua = ?', [idPublicacion]);
+
+    // Eliminar publicación
+    await pool.query('DELETE FROM publicaciongrua WHERE IdPublicacionGrua = ? AND Servicio = ?', [idPublicacion, idServicio]);
+
+    res.json({
+      success: true,
+      message: 'Publicación de grúa eliminada correctamente',
+      data: { idPublicacion: Number(idPublicacion) }
+    });
+  } catch (err) {
+    console.error('❌ Error eliminando publicaciongrua:', err);
+    res.status(500).json({ success: false, message: 'Error al eliminar publicaciongrua' });
+  }
+});
+
+const construirConsultaAgendaGrua = (filtros = {}, soloPrestador = false) => {
+  const { idSolicitudServicio, usuarioNatural, publicacionGrua, estado, idServicio } = filtros;
+
+  let query = `
+    SELECT
+      cas.IdSolicitudServicio AS SolicitudId,
+      cas.IdSolicitudServicio,
+      cas.UsuarioNatural AS ClienteId,
+      cas.UsuarioNatural,
+      CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS Cliente,
+      CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS NombreUsuario,
+      u.Correo AS CorreoUsuario,
+      cas.PublicacionGrua AS PublicacionGruaId,
+      cas.PublicacionGrua,
+      CONCAT(DATE_FORMAT(cas.FechaServicio, '%d/%m/%Y'), ' ', TIME_FORMAT(cas.HoraServicio, '%H:%i')) AS FechaServicio,
+      cas.HoraServicio,
+      cas.DireccionRecogida,
+      cas.Destino,
+      cas.ComentariosAdicionales,
+      cas.Estado AS EstadoDb,
+      CASE
+        WHEN cas.Estado = 'Finalizado' THEN 'Realizado'
+        WHEN cas.Estado = 'En revision' THEN 'Revision'
+        WHEN cas.Estado = 'Pendiente' THEN 'Pendiente'
+        ELSE cas.Estado
+      END AS EstadoEtiqueta,
+      CASE
+        WHEN cas.Estado = 'Finalizado' THEN 'green'
+        WHEN cas.Estado = 'En revision' THEN 'blue'
+        WHEN cas.Estado = 'Pendiente' THEN 'orange'
+        ELSE 'gray'
+      END AS EstadoColor,
+      cas.FechaModificadaPor,
+      cas.NotificacionVista,
+      pg.TituloPublicacion,
+      pg.TarifaBase,
+      COALESCE(pg.TarifaBase, 0) AS Total,
+      pg.ZonaCobertura,
+      pg.FotoPublicacion
+    FROM controlagendaservicios cas
+    INNER JOIN publicaciongrua pg ON pg.IdPublicacionGrua = cas.PublicacionGrua
+    LEFT JOIN usuario u ON u.IdUsuario = cas.UsuarioNatural
+    WHERE 1 = 1
+  `;
+
+  const params = [];
+
+  if (soloPrestador) {
+    query += ' AND pg.Servicio = ?';
+    params.push(idServicio);
+  }
+
+  if (idSolicitudServicio) {
+    query += ' AND cas.IdSolicitudServicio = ?';
+    params.push(idSolicitudServicio);
+  }
+
+  if (usuarioNatural) {
+    query += ' AND cas.UsuarioNatural = ?';
+    params.push(usuarioNatural);
+  }
+
+  if (publicacionGrua) {
+    query += ' AND cas.PublicacionGrua = ?';
+    params.push(publicacionGrua);
+  }
+
+  if (estado) {
+    query += ' AND cas.Estado = ?';
+    params.push(estado);
+  }
+
+  query += ' ORDER BY cas.FechaServicio DESC, cas.HoraServicio DESC, cas.IdSolicitudServicio DESC';
+
+  return { query, params };
+};
+
+app.get('/api/controlagendaservicios', async (req, res) => {
+  const { idSolicitudServicio, usuarioNatural, publicacionGrua, estado } = req.query;
+
+  try {
+    const { query, params } = construirConsultaAgendaGrua({ idSolicitudServicio, usuarioNatural, publicacionGrua, estado });
+    const [rows] = await pool.query(query, params);
+    res.json({ success: true, total: rows.length, solicitudes: rows });
+  } catch (error) {
+    console.error('❌ Error consultando controlagendaservicios:', error);
+    res.status(500).json({ success: false, message: 'Error al consultar controlagendaservicios' });
+  }
+});
+
+app.get('/api/agenda/grua', verificarSesion, async (req, res) => {
+  const usuario = req.session.usuario;
+
+  if (!usuario || usuario.tipo !== 'PrestadorServicio') {
+    return res.status(403).json({ success: false, message: 'Acceso no autorizado. Solo prestadores pueden consultar la agenda.' });
+  }
+
+  try {
+    const [servRows] = await pool.query(
+      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1',
+      [usuario.id]
+    );
+
+    if (servRows.length === 0) {
+      return res.status(404).json({ success: false, message: 'No se encontró registro de prestador para este usuario.' });
+    }
+
+    const idServicio = servRows[0].IdServicio;
+    const { idSolicitudServicio, usuarioNatural, publicacionGrua, estado } = req.query;
+    const { query, params } = construirConsultaAgendaGrua(
+      { idSolicitudServicio, usuarioNatural, publicacionGrua, estado, idServicio },
+      true
+    );
+
+    const [rows] = await pool.query(query, params);
+    res.json({ success: true, total: rows.length, solicitudes: rows });
+  } catch (error) {
+    console.error('❌ Error consultando agenda de grúa:', error);
+    res.status(500).json({ success: false, message: 'Error al consultar agenda de grúa' });
+  }
+});
+
+app.get('/api/historialservicios', async (req, res) => {
+  const { idHistorial, solicitudServicio, usuarioNatural, publicacionGrua, estado } = req.query;
+
+  try {
+    let query = `
+      SELECT
+        hs.IdHistorial,
+        hs.SolicitudServicio,
+        cas.UsuarioNatural,
+        cas.PublicacionGrua,
+        cas.FechaServicio,
+        cas.HoraServicio,
+        cas.DireccionRecogida,
+        cas.Destino,
+        cas.ComentariosAdicionales,
+        cas.Estado,
+        cas.FechaModificadaPor,
+        cas.NotificacionVista,
+        pg.TituloPublicacion,
+        pg.TarifaBase,
+        pg.ZonaCobertura,
+        pg.FotoPublicacion,
+        CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS NombreUsuario,
+        u.Correo AS CorreoUsuario
+      FROM historialservicios hs
+      INNER JOIN controlagendaservicios cas ON cas.IdSolicitudServicio = hs.SolicitudServicio
+      INNER JOIN publicaciongrua pg ON pg.IdPublicacionGrua = cas.PublicacionGrua
+      LEFT JOIN usuario u ON u.IdUsuario = cas.UsuarioNatural
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    if (idHistorial) {
+      query += ' AND hs.IdHistorial = ?';
+      params.push(idHistorial);
+    }
+
+    if (solicitudServicio) {
+      query += ' AND hs.SolicitudServicio = ?';
+      params.push(solicitudServicio);
+    }
+
+    if (usuarioNatural) {
+      query += ' AND cas.UsuarioNatural = ?';
+      params.push(usuarioNatural);
+    }
+
+    if (publicacionGrua) {
+      query += ' AND cas.PublicacionGrua = ?';
+      params.push(publicacionGrua);
+    }
+
+    if (estado) {
+      query += ' AND cas.Estado = ?';
+      params.push(estado);
+    }
+
+    query += ' ORDER BY hs.IdHistorial DESC';
+
+    const [rows] = await pool.query(query, params);
+    res.json({ success: true, total: rows.length, historial: rows });
+  } catch (error) {
+    console.error('❌ Error consultando historialservicios:', error);
+    res.status(500).json({ success: false, message: 'Error al consultar historialservicios' });
+  }
+});
+
+app.get('/api/opinionesgrua', async (req, res) => {
+  const { idOpinion, usuarioNatural, publicacionGrua } = req.query;
+
+  try {
+    let query = `
+      SELECT
+        og.IdOpinion,
+        og.UsuarioNatural,
+        og.PublicacionGrua,
+        og.NombreUsuario,
+        og.Comentario,
+        og.Calificacion,
+        og.Fecha,
+        pg.TituloPublicacion,
+        pg.TarifaBase,
+        CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS NombreCompleto,
+        u.FotoPerfil
+      FROM OpinionesGrua og
+      INNER JOIN publicaciongrua pg ON pg.IdPublicacionGrua = og.PublicacionGrua
+      LEFT JOIN usuario u ON u.IdUsuario = og.UsuarioNatural
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    if (idOpinion) {
+      query += ' AND og.IdOpinion = ?';
+      params.push(idOpinion);
+    }
+
+    if (usuarioNatural) {
+      query += ' AND og.UsuarioNatural = ?';
+      params.push(usuarioNatural);
+    }
+
+    if (publicacionGrua) {
+      query += ' AND og.PublicacionGrua = ?';
+      params.push(publicacionGrua);
+    }
+
+    query += ' ORDER BY og.Fecha DESC, og.IdOpinion DESC';
+
+    const [rows] = await pool.query(query, params);
+    res.json({ success: true, total: rows.length, opiniones: rows });
+  } catch (error) {
+    console.error('❌ Error consultando opinionesgrua:', error);
+    res.status(500).json({ success: false, message: 'Error al consultar opinionesgrua' });
+  }
+});
+
+// ===============================
+// 📄 Obtener publicaciones de grúa con sus opiniones
+// ===============================
+app.get('/api/publicaciones-con-opiniones', async (req, res) => {
+  try {
+    const publicaciones = await queryPromise(`
+      SELECT IdPublicacionGrua AS id, Servicio, TituloPublicacion AS titulo, DescripcionServicio AS descripcion,
+             TarifaBase AS tarifa, ZonaCobertura AS zona, FotoPublicacion AS foto
+      FROM publicaciongrua
+      ORDER BY IdPublicacionGrua DESC
+    `, []);
+
+    const ids = publicaciones.map(p => p.id);
+    let opiniones = [];
+    if (ids.length > 0) {
+      const q = `SELECT * FROM OpinionesGrua WHERE PublicacionGrua IN (${ids.join(',')}) ORDER BY Fecha DESC`;
+      opiniones = await queryPromise(q, []);
+    }
+
+    // Agrupar opiniones por publicacion
+    const mapa = {};
+    opiniones.forEach(op => {
+      if (!mapa[op.PublicacionGrua]) mapa[op.PublicacionGrua] = [];
+      mapa[op.PublicacionGrua].push(op);
+    });
+
+    const resultado = publicaciones.map(pub => ({
+      ...pub,
+      opiniones: mapa[pub.id] || []
+    }));
+
+    res.json({ success: true, total: resultado.length, publicaciones: resultado });
+  } catch (err) {
+    console.error('❌ Error en publicaciones-con-opiniones:', err);
+    res.status(500).json({ success: false, message: 'Error al obtener publicaciones con opiniones' });
+  }
+});
+
+app.get('/api/centrodeayuda', async (req, res) => {
+  const { idAyuda, perfil, tipoSolicitud, rol, respondida } = req.query;
+
+  try {
+    let query = `
+      SELECT
+        ca.IdAyuda,
+        ca.Perfil,
+        ca.TipoSolicitud,
+        ca.Rol,
+        ca.Asunto,
+        ca.Descripcion,
+        ca.Respuesta,
+        ca.FechaRespuesta,
+        ca.Respondida,
+        ca.FechaCreacion,
+        CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS NombreUsuario,
+        u.Correo
+      FROM centroayuda ca
+      LEFT JOIN usuario u ON u.IdUsuario = ca.Perfil
+      WHERE 1 = 1
+    `;
+
+    const params = [];
+
+    if (idAyuda) {
+      query += ' AND ca.IdAyuda = ?';
+      params.push(idAyuda);
+    }
+
+    if (perfil) {
+      query += ' AND ca.Perfil = ?';
+      params.push(perfil);
+    }
+
+    if (tipoSolicitud) {
+      query += ' AND ca.TipoSolicitud = ?';
+      params.push(tipoSolicitud);
+    }
+
+    if (rol) {
+      query += ' AND ca.Rol = ?';
+      params.push(rol);
+    }
+
+    if (respondida) {
+      query += ' AND ca.Respondida = ?';
+      params.push(respondida);
+    }
+
+    query += ' ORDER BY ca.IdAyuda DESC';
+
+    const [rows] = await pool.query(query, params);
+    res.json({ success: true, total: rows.length, solicitudes: rows });
+  } catch (error) {
+    console.error('❌ Error consultando centroayuda:', error);
+    res.status(500).json({ success: false, message: 'Error al consultar centroayuda' });
+  }
+});
+
+// ===============================
+// ✉️ Enviar PQR (Centro de ayuda)
+// ===============================
+app.post('/api/centrodeayuda', async (req, res) => {
+  const usuario = req.session.usuario;
+  if (!usuario) return res.status(401).json({ error: 'Debes iniciar sesión para enviar una PQR.' });
+
+  const { tipoSolicitud, asunto, descripcion } = req.body;
+  if (!tipoSolicitud || !asunto || !descripcion) {
+    return res.status(400).json({ error: 'Faltan campos obligatorios: tipoSolicitud, asunto, descripcion.' });
+  }
+
+  try {
+    const fechaCreacion = new Date();
+    const [result] = await pool.query(
+      `INSERT INTO centroayuda (Perfil, TipoSolicitud, Rol, Asunto, Descripcion, FechaCreacion, Respondida)
+       VALUES (?, ?, ?, ?, ?, ?, 'No')`,
+      [usuario.id, tipoSolicitud, usuario.tipo, asunto, descripcion, fechaCreacion]
+    );
+
+    res.json({ success: true, message: 'PQR enviada correctamente', idAyuda: result.insertId });
+  } catch (err) {
+    console.error('❌ Error creando PQR:', err);
+    res.status(500).json({ success: false, message: 'Error al enviar PQR' });
+  }
+});
+
 
 // ===============================
 //  REGISTRO DE USUARIO-FORMULARIO
 // ===============================
 import fetch from 'node-fetch'; // si no lo tienes instalado: npm install node-fetch
-
-const tempDir = path.join(process.cwd(), 'public', 'imagen', 'temp');
-fs.mkdirSync(tempDir, { recursive: true });
 
 // Guardamos primero en temp
 const storage = multer.diskStorage({
@@ -2328,7 +3189,7 @@ app.post('/api/crear-contrasena-con-token', async (req, res) => {
     const idUsuario = tokenData.Usuario;
 
     // Verificar que el usuario tenga contraseña temporal
-    const [credenciales] = await queryPromise(
+    const [credenciales] = await pool.query(
       'SELECT * FROM credenciales WHERE Usuario = ?',
       [idUsuario]
     );
@@ -2368,7 +3229,6 @@ app.post('/api/crear-contrasena-con-token', async (req, res) => {
   }
 });
 
-
 // ----------------------
 // Helpers
 // ----------------------
@@ -2402,20 +3262,6 @@ function normalizarDireccion(dir) {
 // 📦 CREAR NUEVA PUBLICACIÓN - USUARIO COMERCIANTE
 // ----------------------
 // --- CONFIGURACIÓN MULTER PARA PUBLICACIONES ---
-const storagePublicacion = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, tempDir),
-  filename: (req, file, cb) => {
-    const nombreUnico =
-      Date.now() + '-' + Math.round(Math.random() * 1e9) + path.extname(file.originalname);
-    cb(null, nombreUnico);
-  }
-});
-
-const uploadPublicacion = multer({
-  storage: storagePublicacion,
-  limits: { fileSize: 5 * 1024 * 1024 } // 5 MB
-});
-
 // ===========================
 // 📦 PUBLICAR PRODUCTO
 // ===========================
@@ -2522,224 +3368,80 @@ app.post('/api/publicar', uploadPublicacion.array('imagenesProducto', 5), async 
   } catch (err) {
     console.error('❌ Error en /api/publicar:', err);
     cleanupTempFiles(req.files, tempDir);
-    res.status(500).json({ error: 'Error al registrar la publicación.' });
-  } finally {
-    connection.release();
+    res.status(500).json({ error: 'Hubo un error al publicar.' });
   }
 });
 
+// ==========================================
+// 📋 Endpoint: Obtener MIS publicaciones de grúa
+// ==========================================
+app.get('/api/mis-publicaciones-grua', async (req, res) => {
+  const usuario = req.session.usuario;
 
+  // 🔒 Validación de acceso
+  if (!usuario || usuario.tipo !== 'PrestadorServicio') {
+    return res.status(403).json({ error: 'Acceso no autorizado. Solo prestadores pueden ver estos servicios.' });
+  }
 
-// REGISTRO / HISTORIAL DE PUBLICACIONES
-// ----------------------
-app.get('/api/publicaciones', async (req, res) => {
   try {
-    const usuario = req.session.usuario;
-
-    if (!usuario || usuario.tipo !== 'Comerciante') {
-      return res.status(403).json({ error: 'Acceso no autorizado. Solo comerciantes pueden ver sus publicaciones.' });
-    }
-
-    console.log(`📋 Obteniendo publicaciones para comerciante: ${usuario.id}`);
-
-    // 🔹 1. Buscar el NIT del comercio asociado al usuario
-    const comercio = await queryPromise(
-      'SELECT NitComercio FROM comerciante WHERE Comercio = ? LIMIT 1',
+    // 🔹 1. Obtener el IdServicio del Prestador de Servicio
+    const [rowsServicio] = await pool.query(
+      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ?',
       [usuario.id]
     );
 
-    if (!comercio || comercio.length === 0) {
-      console.log(`⚠️ No se encontró comercio para usuario: ${usuario.id}`);
-      return res.status(404).json({ error: 'No se encontró el comercio asociado a este usuario.' });
+    if (rowsServicio.length === 0) {
+      return res.status(404).json({ error: 'Perfil de prestador no encontrado.' });
     }
 
-    const nitComercio = comercio[0].NitComercio;
-    console.log(`✅ NIT del comercio: ${nitComercio}`);
+    const idServicio = rowsServicio[0].IdServicio;
 
-    // 🔹 2. Obtener publicaciones del comerciante
-    const publicaciones = await queryPromise(
-      `
-        SELECT IdPublicacion, NombreProducto, Precio, ImagenProducto
-        FROM publicacion
-        WHERE comerciante = ?
-        ORDER BY IdPublicacion DESC
-      `,
-      [nitComercio]
+    // 🔹 2. Buscar las publicaciones CON datos del prestador
+    const [misGruas] = await pool.query(
+      `SELECT
+         pg.IdPublicacionGrua,
+         pg.Servicio,
+         pg.TituloPublicacion,
+         pg.DescripcionServicio,
+         pg.TarifaBase,
+         pg.ZonaCobertura,
+         pg.FotoPublicacion,
+         ps.usuario AS IdPrestador,
+         CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS NombrePrestador,
+         u.Correo AS CorreoPrestador
+       FROM publicaciongrua pg
+       INNER JOIN prestadorservicio ps ON pg.Servicio = ps.IdServicio
+       LEFT JOIN usuario u ON ps.usuario = u.IdUsuario
+       WHERE pg.Servicio = ?
+       ORDER BY pg.IdPublicacionGrua DESC`,
+      [idServicio]
     );
 
-    console.log(`✅ ${publicaciones.length} publicaciones encontradas`);
-    res.json(publicaciones);
+    // 🔹 3. Para cada publicación, obtener sus opiniones
+    const resultado = [];
+    for (const pub of misGruas) {
+      const [opiniones] = await pool.query(
+        `SELECT IdOpinion, UsuarioNatural, NombreUsuario, Comentario, Calificacion, Fecha
+         FROM OpinionesGrua WHERE PublicacionGrua = ?
+         ORDER BY Fecha DESC`,
+        [pub.IdPublicacionGrua]
+      );
+
+      resultado.push({
+        ...pub,
+        opiniones: opiniones || []
+      });
+    }
+
+    res.json({ success: true, total: resultado.length, publicaciones: resultado });
   } catch (err) {
-    console.error('❌ Error al obtener las publicaciones:', err);
-    res.status(500).json({ error: 'Error interno al obtener las publicaciones.' });
+    console.error('❌ Error en /api/mis-publicaciones-grua:', err);
+    res.status(500).json({ error: 'Error del servidor al obtener las publicaciones de grúa.' });
   }
 });
-
-
-
-// ELIMINAR PUBLICACIÓN Y SU CARPETA
-// ----------------------
-app.delete('/api/publicaciones/:id', async (req, res) => {
-  try {
-    const usuario = req.session.usuario;
-    const idPublicacion = req.params.id;
-
-    if (!usuario || usuario.tipo !== 'Comerciante') {
-      return res.status(403).json({ error: 'Acceso no autorizado. Solo comerciantes pueden eliminar publicaciones.' });
-    }
-
-    // 🔹 1️⃣ Obtener el NIT del comercio asociado al usuario
-    const [comercio] = await pool.query(
-      'SELECT NitComercio FROM comerciante WHERE Comercio = ? LIMIT 1',
-      [usuario.id]
-    );
-
-    if (!comercio || comercio.length === 0) {
-      return res.status(404).json({ error: 'No se encontró el comercio asociado.' });
-    }
-
-    const nitComercio = comercio[0].NitComercio;
-
-    // 🔹 2️⃣ Verificar que la publicación exista y obtener las imágenes
-    const [publicacion] = await pool.query(
-      'SELECT ImagenProducto FROM publicacion WHERE IdPublicacion = ? AND Comerciante = ?',
-      [idPublicacion, nitComercio]
-    );
-
-    if (!publicacion || publicacion.length === 0) {
-      return res.status(404).json({ error: 'No se encontró la publicación o no pertenece a tu comercio.' });
-    }
-
-    let imagenes = [];
-    try {
-      imagenes = JSON.parse(publicacion[0].ImagenProducto || '[]');
-    } catch (parseErr) {
-      console.warn('⚠️ No se pudieron parsear las imágenes:', parseErr);
-    }
-
-    // 🔹 3️⃣ Eliminar productos asociados
-    await pool.query('DELETE FROM producto WHERE PublicacionComercio = ?', [idPublicacion]);
-
-    // 🔹 4️⃣ Eliminar la publicación
-    await pool.query('DELETE FROM publicacion WHERE IdPublicacion = ? AND Comerciante = ?', [
-      idPublicacion,
-      nitComercio
-    ]);
-
-    // 🔹 5️⃣ Eliminar carpeta completa de la publicación
-    const carpetaPublicacion = path.join(
-      __dirname,
-      'public',
-      'imagen',
-      'Comerciante',
-      usuario.id.toString(),
-      'publicaciones',
-      idPublicacion.toString()
-    );
-
-    try {
-      if (fs.existsSync(carpetaPublicacion)) {
-        fs.rmSync(carpetaPublicacion, { recursive: true, force: true });
-        console.log(`🗑️ Carpeta eliminada correctamente: ${carpetaPublicacion}`);
-      } else {
-        console.warn('⚠️ Carpeta no encontrada (posiblemente ya eliminada):', carpetaPublicacion);
-      }
-    } catch (fsErr) {
-      console.error('❌ Error al eliminar carpeta:', fsErr);
-    }
-
-    // 🔹 6️⃣ Confirmar eliminación
-    res.json({
-      mensaje: '✅ Publicación, productos asociados y carpeta eliminados exitosamente.'
-    });
-  } catch (err) {
-    console.error('❌ Error al eliminar publicación:', err);
-    res.status(500).json({ error: 'Error interno al eliminar la publicación.' });
-  }
-});
-
-
-// 🟢 OBTENER UNA PUBLICACIÓN EN ESPECÍFICO POR ID - editar publicacion
-app.get('/api/publicaciones/:id', async (req, res) => {
-  try {
-    const usuario = req.session.usuario;
-    const idPublicacion = req.params.id;
-
-    if (!usuario || usuario.tipo !== 'Comerciante') {
-      return res.status(403).json({ error: 'Acceso no autorizado. Solo comerciantes pueden ver publicaciones.' });
-    }
-
-    // 🔹 1️⃣ Obtener el NIT del comercio asociado al usuario
-    const [comercio] = await pool.query(
-      'SELECT NitComercio FROM comerciante WHERE Comercio = ? LIMIT 1',
-      [usuario.id]
-    );
-
-    if (!comercio || comercio.length === 0) {
-      return res.status(404).json({ error: 'No se encontró el comercio asociado.' });
-    }
-
-    const nitComercio = comercio[0].NitComercio;
-
-    // 🔹 2️⃣ Traer los datos completos de la publicación
-    const queryPublicacion = `
-      SELECT 
-        IdPublicacion,
-        NombreProducto,
-        Descripcion,
-        Categoria AS IdCategoria,
-        (SELECT NombreCategoria FROM categoria WHERE IdCategoria = Publicacion.Categoria) AS NombreCategoria,
-        Precio,
-        ImagenProducto
-      FROM publicacion
-      WHERE IdPublicacion = ? AND Comerciante = ?
-      LIMIT 1
-    `;
-
-    const [publicacion] = await pool.query(queryPublicacion, [idPublicacion, nitComercio]);
-
-    if (!publicacion || publicacion.length === 0) {
-      return res.status(404).json({ error: 'Publicación no encontrada o no pertenece al comerciante.' });
-    }
-
-    // 🔹 3️⃣ Parsear imágenes si existen
-    const pub = publicacion[0];
-    try {
-      pub.ImagenProducto = JSON.parse(pub.ImagenProducto || '[]');
-    } catch {
-      pub.ImagenProducto = [];
-    }
-
-    // 🔹 4️⃣ Respuesta final
-    res.json(pub);
-
-  } catch (err) {
-    console.error('❌ Error al obtener la publicación:', err);
-    res.status(500).json({ error: 'Error interno al obtener la publicación.' });
-  }
-});
-
-// ----------------------
-// OBTENER TODAS LAS CATEGORÍAS
-// ----------------------
-app.get('/api/categorias', async (req, res) => {
-  try {
-    const [categorias] = await pool.query(
-      'SELECT IdCategoria, NombreCategoria FROM categoria ORDER BY NombreCategoria ASC'
-    );
-
-    // 🔹 Filtramos categorías que contengan "grua"
-    const categoriasFiltradas = categorias.filter(c =>
-      !c.NombreCategoria.toLowerCase().includes('grua')
-    );
-
-    res.json(categoriasFiltradas);
-  } catch (err) {
-    console.error('❌ Error al obtener categorías:', err);
-    res.status(500).json({ error: 'Error al obtener las categorías.' });
-  }
-});
-
+// ===============================
+// ACTUALIZAR PUBLICACION (Modificar Producto)
+// ===============================
 // ----------------------
 // EDITAR Y ACTUALIZAR UNA PUBLICACIÓN
 // ----------------------
@@ -2801,7 +3503,7 @@ app.put('/api/publicaciones/:id', uploadEditar.array('imagenesNuevas', 10), asyn
     );
 
     if (!resultPub || resultPub.length === 0) {
-      return res.status(404).json({ error: 'Publicación no encontrada o no pertenece al comerciante.' });
+      return res.status(404).json({ error: 'Publicación no encontrada o no pertenece a tu comercio.' });
     }
 
     let anteriores = [];
@@ -2843,2373 +3545,9 @@ app.put('/api/publicaciones/:id', uploadEditar.array('imagenesNuevas', 10), asyn
   }
 });
 
-// DASHBOARD USUARIO COMERCIANTE
-// ----------------------
-
-app.get('/api/dashboard/comerciante', async (req, res) => {
-  try {
-    // 🧩 Validar sesión activa
-    if (!req.session || !req.session.usuario) {
-      return res.status(401).json({ error: 'No has iniciado sesión.' });
-    }
-
-    const idUsuario = req.session.usuario.id;
-    const { dia, categoria, anio } = req.query;
-    
-    console.log('📊 Cargando dashboard del comerciante:', idUsuario, 'Filtros:', { dia, categoria, anio });
-
-    // 🔍 Obtener el NIT del comerciante logueado
-    const comercianteRows = await queryPromise(
-      'SELECT NitComercio FROM comerciante WHERE Comercio = ?',
-      [idUsuario]
-    );
-
-    if (comercianteRows.length === 0) {
-      return res.status(403).json({ error: 'No se encontró información del comerciante.' });
-    }
-
-    const nitComercio = comercianteRows[0].NitComercio;
-
-    // 🧾 Consultar las ventas del comerciante usando detallefacturacomercio
-    // SOLO contar como ventas cuando ConfirmacionUsuario = 'Recibido'
-    let query = `
-      SELECT 
-        c.NombreComercio,
-        cat.NombreCategoria,
-        p.NombreProducto,
-        COUNT(dfc.IdDetalleFacturaComercio) AS totalVentas,
-        SUM(dfc.Total) AS totalRecaudado,
-        DATE(f.FechaCompra) AS fechaCompra
-      FROM detallefacturacomercio dfc
-      INNER JOIN factura f ON dfc.Factura = f.IdFactura
-      INNER JOIN publicacion p ON dfc.Publicacion = p.IdPublicacion
-      INNER JOIN categoria cat ON p.Categoria = cat.IdCategoria
-      INNER JOIN comerciante c ON p.Comerciante = c.NitComercio
-      WHERE c.NitComercio = ? AND dfc.ConfirmacionUsuario = 'Recibido'
-    `;
-    
-    const params = [nitComercio];
-    
-    // Agregar filtros dinámicos
-    if (dia) {
-      query += ' AND DATE(f.FechaCompra) = ?';
-      params.push(dia);
-    }
-    
-    if (categoria) {
-      query += ' AND cat.NombreCategoria = ?';
-      params.push(categoria);
-    }
-    
-    if (anio) {
-      query += ' AND YEAR(f.FechaCompra) = ?';
-      params.push(anio);
-    }
-    
-    query += `
-      GROUP BY cat.NombreCategoria, p.NombreProducto, fechaCompra
-      ORDER BY fechaCompra DESC
-    `;
-
-    const result = await queryPromise(query, params);
-
-    // 💰 Calcular totales
-    let totalVentas = 0;
-    let totalRecaudado = 0;
-    let ventasPorCategoria = {};
-    let categorias = new Set();
-
-    result.forEach(row => {
-      totalVentas += row.totalVentas;
-      totalRecaudado += row.totalRecaudado || 0;
-      categorias.add(row.NombreCategoria);
-      ventasPorCategoria[row.NombreCategoria] = (ventasPorCategoria[row.NombreCategoria] || 0) + (row.totalRecaudado || 0);
-    });
-
-    // 📅 Ventas del día y de la semana
-    const hoy = new Date().toISOString().split('T')[0];
-    const semanaPasada = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString().split('T')[0];
-
-    const ventasHoy = result
-      .filter(r => r.fechaCompra === hoy)
-      .reduce((acc, r) => acc + (r.totalRecaudado || 0), 0);
-
-    const ventasSemana = result
-      .filter(r => r.fechaCompra >= semanaPasada)
-      .reduce((acc, r) => acc + (r.totalRecaudado || 0), 0);
-
-    console.log('✅ Dashboard del comerciante cargado correctamente');
-
-    // 📤 Respuesta final
-    res.json({
-      totalVentas,
-      totalRecaudado,
-      ventasHoy,
-      ventasSemana,
-      categorias: Array.from(categorias),
-      ventasPorCategoria: Array.from(categorias).map(cat => ventasPorCategoria[cat] || 0)
-    });
-
-  } catch (error) {
-    console.error('❌ Error en dashboard comerciante:', error);
-    res.status(500).json({ error: 'Error en el servidor al obtener el dashboard del comerciante.' });
-  }
-});
-
-
-//  EDITAR - ACTUALIZAR PERFIL COMERCIANTE
-// ===============================
-app.put(
-  "/api/actualizarPerfilComerciante/:idUsuario",
-  upload.single("FotoPerfil"),
-  async (req, res) => {
-    const { idUsuario } = req.params;
-    const data = req.body || {};
-    const nuevaFoto = req.file || null;
-
-    try {
-      // 1️⃣ Verificar si el usuario existe
-      const [usuarioRows] = await pool.query(
-        "SELECT FotoPerfil FROM usuario WHERE IdUsuario = ?",
-        [idUsuario]
-      );
-
-      if (usuarioRows.length === 0) {
-        return res.status(404).json({ error: "Usuario no encontrado" });
-      }
-
-      let rutaFotoFinal = usuarioRows[0].FotoPerfil;
-
-      // 2️⃣ Si se sube una nueva foto de perfil
-      if (nuevaFoto) {
-        const tipoFolder = "Comerciante";
-        const userFolder = path.join(
-          __dirname,
-          "public",
-          "imagen",
-          tipoFolder,
-          idUsuario
-        );
-
-        // Crear carpeta si no existe
-        fs.mkdirSync(userFolder, { recursive: true });
-
-        // Eliminar foto anterior (si existe)
-        if (rutaFotoFinal) {
-          const rutaFotoAnterior = path.join(__dirname, "public", rutaFotoFinal);
-          if (fs.existsSync(rutaFotoAnterior)) {
-            fs.unlinkSync(rutaFotoAnterior);
-          }
-        }
-
-        // Generar nuevo nombre único
-        const nuevoNombreFoto = `${Date.now()}_${Math.round(
-          Math.random() * 1e6
-        )}${path.extname(nuevaFoto.originalname)}`;
-
-        const rutaDestino = path.join(userFolder, nuevoNombreFoto);
-
-        // Mover archivo desde la carpeta temporal
-        fs.renameSync(nuevaFoto.path, rutaDestino);
-
-        // Guardar ruta relativa (para mostrar en frontend)
-        rutaFotoFinal = path
-          .join("imagen", tipoFolder, idUsuario, nuevoNombreFoto)
-          .replace(/\\/g, "/");
-
-        // Actualizar campo de la foto en la base de datos
-        await pool.query(
-          "UPDATE usuario SET FotoPerfil = ? WHERE IdUsuario = ?",
-          [rutaFotoFinal, idUsuario]
-        );
-      }
-
-      // 3️⃣ Actualizar información básica del usuario
-      await pool.query(
-        `UPDATE usuario 
-         SET Nombre = ?, Apellido = ?, Telefono = ?, Correo = ?
-         WHERE IdUsuario = ?`,
-        [
-          data.Nombre || null,
-          data.Apellido || null,
-          data.Telefono || null,
-          data.Correo || null,
-          idUsuario,
-        ]
-      );
-
-      // 4️⃣ Actualizar información del comercio asociado
-      await pool.query(
-        `UPDATE Comerciante
-         SET NombreComercio = ?, NitComercio = ?, Direccion = ?, Barrio = ?, RedesSociales = ?,
-             DiasAtencion = ?, HoraInicio = ?, HoraFin = ?
-         WHERE Comercio = ?`,
-        [
-          data.NombreComercio || null,
-          data.NitComercio || null,
-          data.Direccion || null,
-          data.Barrio || null,
-          data.RedesSociales || null,
-          data.DiasAtencion || null,
-          data.HoraInicio || null,
-          data.HoraFin || null,
-          idUsuario,
-        ]
-      );
-
-      // ✅ Respuesta final
-      res.json({
-        mensaje: "✅ Perfil actualizado correctamente",
-        fotoPerfil: rutaFotoFinal,
-      });
-    } catch (error) {
-      console.error("❌ Error al actualizar perfil comerciante:", error);
-      res.status(500).json({ error: "Error interno del servidor" });
-    }
-  }
-);
-
-// 📋 OBTENER PERFIL DEL COMERCIANTE
-// ===============================
-app.get("/api/perfilComerciante/:idUsuario", async (req, res) => {
-  const { idUsuario } = req.params;
-
-  try {
-    console.log(`📖 Obteniendo perfil comerciante para usuario: ${idUsuario}`);
-    
-    const rows = await queryPromise(
-      `
-      SELECT 
-        u.IdUsuario,
-        u.Nombre,
-        u.Apellido,
-        u.Telefono,
-        u.Correo,
-        u.FotoPerfil,
-        c.NombreComercio,
-        c.NitComercio,
-        c.Direccion,
-        c.Barrio,
-        c.RedesSociales,
-        c.DiasAtencion,
-        c.HoraInicio,
-        c.HoraFin
-      FROM usuario u
-      LEFT JOIN comerciante c ON u.IdUsuario = c.Comercio
-      WHERE u.IdUsuario = ?
-      `,
-      [idUsuario]
-    );
-
-    if (!rows || rows.length === 0) {
-      console.log(`⚠️ Comerciante no encontrado: ${idUsuario}`);
-      return res.status(404).json({ error: "Comerciante no encontrado" });
-    }
-
-    console.log(`✅ Perfil comerciante encontrado:`, rows[0]);
-    res.json(rows[0]);
-  } catch (error) {
-    console.error("❌ Error al obtener perfil del comerciante:", error);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-///APARTADO DE CONTROL DE AGENDA - COMERCIANTE 
-
-app.get('/api/citas-comerciante', async (req, res) => {
-  const usuario = req.session?.usuario;
-
-  if (!usuario) {
-    return res.status(401).json({ error: 'No autenticado' });
-  }
-
-  try {
-    // 🔍 Obtener el NIT del comerciante logueado
-    const comercianteRows = await queryPromise(
-      'SELECT NitComercio FROM comerciante WHERE Comercio = ?',
-      [usuario.id]
-    );
-
-    if (comercianteRows.length === 0) {
-      return res.status(404).json({ error: 'Comerciante no encontrado' });
-    }
-
-    const nitComercio = comercianteRows[0].NitComercio;
-
-    // 🧾 Obtener las citas/pedidos del comerciante desde controlagendacomercio
-    const citas = await queryPromise(`
-      SELECT 
-        ca.IdSolicitud AS id,
-        p.NombreProducto AS title,
-        ca.FechaServicio AS fechaServicio,
-        ca.HoraServicio AS horaServicio,
-        ca.ModoServicio AS modoServicio,
-        ca.ComentariosAdicionales AS comentarios,
-        u.Nombre AS cliente,
-        dfc.Cantidad AS cantidad,
-        dfc.Total AS total,
-        dfc.Estado AS estado,
-        f.MetodoPago AS metodoPago,
-        f.FechaCompra AS fechaCompra
-      FROM controlagendacomercio ca
-      JOIN detallefacturacomercio dfc ON ca.DetFacturacomercio = dfc.IdDetalleFacturaComercio
-      JOIN factura f ON dfc.Factura = f.IdFactura
-      JOIN publicacion p ON dfc.Publicacion = p.IdPublicacion
-      LEFT JOIN usuario u ON f.Usuario = u.IdUsuario
-      WHERE ca.Comercio = ?
-      ORDER BY ca.FechaServicio DESC, f.FechaCompra DESC
-    `, [nitComercio]);
-
-    // Formatear datos para FullCalendar y lista
-    const eventosFormateados = citas.map(cita => {
-      // Solo incluir en calendario si tiene fecha confirmada
-      const tieneFecha = cita.fechaServicio && cita.fechaServicio !== '';
-      
-      return {
-        id: cita.id,
-        title: `${cita.title} - ${cita.cliente || 'Cliente'}`,
-        start: tieneFecha ? cita.fechaServicio : null, // null = no aparece en calendario
-        extendedProps: {
-          descripcion: `Cliente: ${cita.cliente || 'N/A'} | Cantidad: ${cita.cantidad} | Total: $${Number(cita.total || 0).toLocaleString()} | Estado: ${cita.estado}`,
-          hora: cita.horaServicio || 'Sin confirmar',
-          cliente: cita.cliente,
-          cantidad: cita.cantidad,
-          total: cita.total,
-          estado: cita.estado,
-          metodoPago: cita.metodoPago,
-          modoServicio: cita.modoServicio,
-          comentarios: cita.comentarios,
-          fechaServicio: cita.fechaServicio,
-          fechaCompra: cita.fechaCompra,
-          tieneFecha: tieneFecha
-        }
-      };
-    });
-
-    res.json(eventosFormateados);
-  } catch (error) {
-    console.error('Error al obtener citas:', error);
-    res.status(500).json({ error: 'Error al obtener citas' });
-  }
-});
-
-// Endpoint para eliminar un pedido del control de agenda
-app.delete('/api/eliminar-pedido/:id', async (req, res) => {
-  const usuario = req.session?.usuario;
-  const pedidoId = req.params.id;
-
-  if (!usuario) {
-    return res.status(401).json({ error: 'No autenticado' });
-  }
-
-  try {
-    // Eliminar de controlagendacomercio
-    await queryPromise(
-      'DELETE FROM controlagendacomercio WHERE IdSolicitud = ?',
-      [pedidoId]
-    );
-
-    res.json({ message: '✅ Pedido eliminado correctamente' });
-  } catch (error) {
-    console.error('Error al eliminar pedido:', error);
-    res.status(500).json({ error: 'Error al eliminar pedido' });
-  }
-});
-
-// Endpoint para actualizar fecha de entrega en contraentrega
-app.put('/api/actualizar-fecha-pedido', async (req, res) => {
-  const usuario = req.session?.usuario;
-  const { id, fecha, hora } = req.body;
-
-  if (!usuario) {
-    return res.status(401).json({ error: 'No autenticado' });
-  }
-
-  if (!id || !fecha || !hora) {
-    return res.status(400).json({ error: 'Faltan datos requeridos' });
-  }
-
-  try {
-    // Actualizar fecha y hora en controlagendacomercio
-    // Marcar FechaModificadaPor y NotificacionVista = 0 para que el usuario vea la notificación
-    const ahora = new Date().toISOString();
-    await queryPromise(
-      'UPDATE controlagendacomercio SET FechaServicio = ?, HoraServicio = ?, FechaModificadaPor = ?, NotificacionVista = 0 WHERE IdSolicitud = ?',
-      [fecha, hora, ahora, id]
-    );
-
-    res.json({ 
-      success: true,
-      message: '✅ Fecha de entrega actualizada correctamente' 
-    });
-  } catch (error) {
-    console.error('Error al actualizar fecha:', error);
-    res.status(500).json({ error: 'Error al actualizar fecha' });
-  }
-});
-
-// Endpoint para confirmar fecha de entrega (aceptar fecha propuesta por el cliente)
-app.put('/api/confirmar-fecha-pedido', async (req, res) => {
-  const usuario = req.session?.usuario;
-  const { id, fecha, hora, confirmar } = req.body;
-
-  if (!usuario) {
-    return res.status(401).json({ error: 'No autenticado' });
-  }
-
-  if (!id || !fecha || !hora) {
-    return res.status(400).json({ error: 'Faltan datos requeridos' });
-  }
-
-  try {
-    // Confirmar/actualizar fecha y hora en controlagendacomercio
-    await queryPromise(
-      'UPDATE controlagendacomercio SET FechaServicio = ?, HoraServicio = ? WHERE IdSolicitud = ?',
-      [fecha, hora, id]
-    );
-
-    res.json({ 
-      success: true,
-      message: '✅ Fecha de entrega confirmada correctamente' 
-    });
-  } catch (error) {
-    console.error('Error al confirmar fecha:', error);
-    res.status(500).json({ error: 'Error al confirmar fecha' });
-  }
-});
-
-// Endpoint para marcar notificación de cambio de fecha de comercio como vista
-app.put('/api/comercio/notificacion-vista/:id', async (req, res) => {
-  const { id } = req.params;
-
-  if (!id) {
-    return res.status(400).json({ error: 'ID de solicitud requerido' });
-  }
-
-  try {
-    await queryPromise(
-      'UPDATE controlagendacomercio SET NotificacionVista = 1 WHERE IdSolicitud = ?',
-      [id]
-    );
-
-    res.json({ 
-      success: true,
-      message: 'Notificación marcada como vista' 
-    });
-  } catch (error) {
-    console.error('Error al marcar notificación:', error);
-    res.status(500).json({ error: 'Error al marcar notificación' });
-  }
-});
-
-// ---------------------- 
-// SECCION USUARIO NATURAL 
-// ----------------------
-// Ruta para editar y visualizar los datos del perfil
-
-app.put("/api/actualizarPerfilNatural/:idUsuario", upload.single("FotoPerfil"), async (req, res) => {
-  const { idUsuario } = req.params;
-  const data = req.body || {};
-  const nuevaFoto = req.file || null;
-
-  try {
-    console.log(`📝 Actualizando perfil natural para usuario: ${idUsuario}`);
-    
-    const usuarioRows = await queryPromise(
-      "SELECT FotoPerfil FROM usuario WHERE IdUsuario = ?",
-      [idUsuario]
-    );
-
-    if (!usuarioRows || usuarioRows.length === 0) {
-      console.log(`⚠️ Usuario no encontrado: ${idUsuario}`);
-      return res.status(404).json({ error: "Usuario no encontrado" });
-    }
-
-    let rutaFotoFinal = usuarioRows[0].FotoPerfil;
-
-    if (nuevaFoto) {
-      console.log(`📸 Nueva foto detectada: ${nuevaFoto.originalname}`);
-      const tipoFolder = "Natural";
-      const userFolder = path.join(__dirname, "public", "imagen", tipoFolder, idUsuario);
-      fs.mkdirSync(userFolder, { recursive: true });
-
-      if (rutaFotoFinal) {
-        const rutaFotoAnterior = path.join(__dirname, "public", rutaFotoFinal);
-        if (fs.existsSync(rutaFotoAnterior)) {
-          fs.unlinkSync(rutaFotoAnterior);
-          console.log(`🗑️ Foto anterior eliminada`);
-        }
-      }
-
-      const nuevoNombreFoto = `${Date.now()}_${Math.round(Math.random() * 1e6)}${path.extname(nuevaFoto.originalname)}`;
-      const rutaDestino = path.join(userFolder, nuevoNombreFoto);
-      fs.renameSync(nuevaFoto.path, rutaDestino);
-
-      rutaFotoFinal = path.join("imagen", tipoFolder, idUsuario, nuevoNombreFoto).replace(/\\/g, "/");
-
-      await queryPromise("UPDATE usuario SET FotoPerfil = ? WHERE IdUsuario = ?", [rutaFotoFinal, idUsuario]);
-      console.log(`✅ Foto actualizada: ${rutaFotoFinal}`);
-    }
-
-    await queryPromise(
-      `UPDATE usuario 
-       SET Nombre = ?, Apellido = ?, Telefono = ?, Correo = ?
-       WHERE IdUsuario = ?`,
-      [
-        data.Nombre || null,
-        data.Apellido || null,
-        data.Telefono || null,
-        data.Correo || null,
-        idUsuario,
-      ]
-    );
-    console.log(`✅ Datos de usuario actualizados`);
-
-    // SQLite compatible: verificar si existe y luego UPDATE o INSERT
-    const perfilExiste = await queryPromise(
-      `SELECT UsuarioNatural FROM perfilnatural WHERE UsuarioNatural = ?`,
-      [idUsuario]
-    );
-
-    if (perfilExiste && perfilExiste.length > 0) {
-      await queryPromise(
-        `UPDATE perfilnatural SET Direccion = ?, Barrio = ? WHERE UsuarioNatural = ?`,
-        [data.Direccion || null, data.Barrio || null, idUsuario]
-      );
-      console.log(`✅ Perfil natural actualizado`);
-    } else {
-      await queryPromise(
-        `INSERT INTO perfilnatural (UsuarioNatural, Direccion, Barrio) VALUES (?, ?, ?)`,
-        [idUsuario, data.Direccion || null, data.Barrio || null]
-      );
-      console.log(`✅ Perfil natural creado`);
-    }
-
-    res.json({ mensaje: "✅ Perfil actualizado correctamente", fotoPerfil: rutaFotoFinal });
-  } catch (error) {
-    console.error("❌ Error al actualizar perfil natural:", error);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-
-//visualizacion del perfil 
-
-app.get("/api/perfilNatural/:idUsuario", async (req, res) => {
-  const { idUsuario } = req.params;
-
-  try {
-    console.log(`📖 Obteniendo perfil natural para usuario: ${idUsuario}`);
-    
-    const rows = await queryPromise(
-      `SELECT 
-         u.IdUsuario,
-         u.Nombre,
-         u.Apellido,
-         u.Telefono,
-         u.Correo,
-         u.FotoPerfil,
-         pn.Direccion,
-         pn.Barrio
-       FROM usuario u
-       LEFT JOIN perfilnatural pn ON u.IdUsuario = pn.UsuarioNatural
-       WHERE u.IdUsuario = ?`,
-      [idUsuario]
-    );
-
-    if (!rows || rows.length === 0) {
-      console.log(`⚠️ Perfil no encontrado para usuario: ${idUsuario}`);
-      return res.status(404).json({ error: "Usuario no encontrado" });
-    }
-
-    console.log(`✅ Perfil encontrado para: ${rows[0].Nombre} ${rows[0].Apellido}`);
-    res.json(rows[0]);
-  } catch (error) {
-    console.error("❌ Error al obtener perfil natural:", error);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-// ----------------------
-// PUBLICACIONES PÚBLICAS (visibles para todos)
-
-app.get('/api/publicaciones_publicas', async (req, res) => {
-  try {
-    const { categoria, limite } = req.query;
-    console.log('📥 GET /api/publicaciones_publicas - categoria:', categoria, 'limite:', limite);
-
-    let query = `
-      SELECT 
-        p.IdPublicacion,
-        p.NombreProducto AS nombreProducto,
-        p.Precio,
-        (SELECT NombreCategoria FROM categoria WHERE IdCategoria = p.Categoria) AS categoria,
-        p.ImagenProducto
-      FROM publicacion p
-      WHERE 1
-    `;
-
-    const params = [];
-
-    // 🔹 Filtro opcional por categoría
-    if (categoria && categoria.toLowerCase() !== 'todos') {
-      query += ` AND p.Categoria = (SELECT IdCategoria FROM categoria WHERE LOWER(NombreCategoria) = LOWER(?))`;
-      params.push(categoria);
-    }
-
-    // 🔹 Ordenar por las más recientes
-    query += ` ORDER BY p.IdPublicacion DESC`;
-
-    // 🔹 Límite opcional
-    if (limite) {
-      query += ` LIMIT ?`;
-      params.push(parseInt(limite));
-    }
-
-    const [rows] = await pool.query(query, params);
-    console.log(`✅ Encontradas ${rows.length} publicaciones`);
-
-    // 🔹 Parsear imágenes y normalizar rutas
-    const publicaciones = rows.map(pub => {
-      let imagenes = [];
-      try {
-        imagenes = JSON.parse(pub.ImagenProducto || '[]');
-
-        // Normalizar rutas: reemplazar backslashes y agregar /image/ si no existe
-          imagenes = JSON.parse(pub.ImagenProducto || '[]');
-
-          imagenes = imagenes.map(img => {
-            let ruta = img.replace(/\\/g, '/').trim();
-
-            // ✅ Elimina cualquier prefijo incorrecto como "Natural/"
-            ruta = ruta.replace(/^Natural\//i, '');
-
-            // ✅ Asegura que comience con "/imagen/"
-            if (!ruta.startsWith('imagen/')) {
-              ruta = 'imagen/' + ruta.replace(/^\/?imagen\//i, '');
-            }
-
-            return '/' + ruta;
-          });
-
-
-
-      } catch {
-        imagenes = [];
-      }
-
-      return {
-        idPublicacion: pub.IdPublicacion,
-        nombreProducto: pub.nombreProducto,
-        precio: pub.Precio,
-        categoria: pub.categoria,
-        imagenes
-      };
-    });
-
-    res.json(publicaciones);
-
-  } catch (error) {
-    console.error('❌ Error al obtener publicaciones públicas:', error);
-    res.status(500).json({ error: 'Error al obtener publicaciones públicas.' });
-  }
-});
-
-// ============================
-// Ruta API para detalle de publicación
-// ============================
-app.get('/api/detallePublicacion/:id', async (req, res) => {
-    const idPublicacion = req.params.id;
-
-    try {
-        // Consulta principal de la publicación
-        const [resultado] = await pool.query(
-            `SELECT 
-                p.IdPublicacion,
-                p.NombreProducto,
-                p.Descripcion,
-                p.Precio,
-                p.Stock,
-                p.ImagenProducto,
-                p.FechaPublicacion,
-                c.NombreComercio,
-                c.Comercio AS IdComerciante,
-                c.Latitud,
-                c.Longitud,
-                c.Barrio,
-                c.Direccion,
-                c.DiasAtencion,
-                c.HoraInicio,
-                c.HoraFin,
-                u.Nombre AS NombreUsuario,
-                u.Apellido AS ApellidoUsuario,
-                IFNULL(AVG(o.Calificacion), 0) AS CalificacionPromedio
-            FROM publicacion p
-            JOIN comerciante c ON p.Comerciante = c.NitComercio
-            JOIN usuario u ON c.Comercio = u.IdUsuario
-            LEFT JOIN opiniones o ON o.Publicacion = p.IdPublicacion
-            WHERE p.IdPublicacion = ?
-            GROUP BY p.IdPublicacion, c.NombreComercio, c.Latitud, c.Longitud, c.Barrio, c.Direccion, c.DiasAtencion, c.HoraInicio, c.HoraFin, u.Nombre, u.Apellido`,
-            [idPublicacion]
-        );
-
-        if (resultado.length === 0) {
-            return res.status(404).json({ msg: 'Publicación no encontrada' });
-        }
-
-        // Consulta de opiniones (sin respuestas - feature no implementada)
-        const [opiniones] = await pool.query(
-            `SELECT 
-                o.IdOpinion, 
-                o.Comentario, 
-                o.Calificacion, 
-                o.FechaOpinion, 
-                u.Nombre, 
-                u.Apellido
-            FROM opiniones o
-            JOIN usuario u ON o.UsuarioNatural = u.IdUsuario
-            WHERE o.Publicacion = ?
-            ORDER BY o.FechaOpinion DESC`,
-            [idPublicacion]
-        );
-
-        // Guardar la imagen como string directamente (sin parse)
-            let imagenes = [];
-            try {
-              imagenes = JSON.parse(resultado[0].ImagenProducto || '[]');
-
-              imagenes = imagenes.map(img => {
-                let ruta = img.replace(/\\/g, '/').trim();
-                ruta = ruta.replace(/^Natural\//i, ''); // elimina prefijo incorrecto
-                if (!ruta.startsWith('imagen/')) {
-                  ruta = 'imagen/' + ruta.replace(/^\/?imagen\//i, '');
-                }
-                return '/' + ruta;
-              });
-            } catch {
-              imagenes = ['/imagen/placeholder.png'];
-            }
-
-        // Enviar datos completos
-          res.json({
-            publicacion: {
-              ...resultado[0],
-              ImagenProducto: imagenes
-            },
-            opiniones
-          });
-
-
-    } catch (err) {
-        console.error('Error en /api/detallePublicacion/:id', err);
-        res.status(500).json({ msg: 'Error en el servidor' });
-    }
-});
-
-
-//AGREGAR AL CARRITO//
-
-// Middleware
-app.use(express.urlencoded({ extended: true }));
-
-// ✅ Ruta para agregar producto al carrito
-app.post('/api/carrito', async (req, res) => {
-    try {
-        const { idUsuario, idPublicacion } = req.body;
-
-        if (!idUsuario || !idPublicacion) {
-            return res.status(400).json({ msg: 'Faltan datos necesarios' });
-        }
-
-        // 🔹 Consultar el precio del producto desde la publicación
-        const [producto] = await pool.query(
-            `SELECT Precio FROM publicacion WHERE IdPublicacion = ?`,
-            [idPublicacion]
-        );
-
-        if (producto.length === 0) {
-            return res.status(404).json({ msg: 'Publicación no encontrada' });
-        }
-
-        const precio = producto[0].Precio;
-
-        // 🔹 Insertar en la tabla Carrito
-        await pool.query(
-            `INSERT INTO Carrito (UsuarioNat, Publicacion, Cantidad, SubTotal, Estado)
-             VALUES (?, ?, 1, ?, 'Pendiente')`,
-            [idUsuario, idPublicacion, precio]
-        );
-
-        res.json({ msg: 'Producto añadido al carrito correctamente' });
-    } catch (err) {
-        console.error('❌ Error al agregar al carrito:', err);
-        res.status(500).json({ msg: 'Error al agregar el producto al carrito' });
-    }
-});
-
-//AGREGAR OPINIONES//
-
-app.post('/api/opiniones', async (req, res) => {
-  try {
-    const { usuarioId, idPublicacion, nombreUsuario, comentario, calificacion } = req.body;
-
-    if (!usuarioId || !idPublicacion || !comentario || !calificacion) {
-      return res.status(400).json({ error: 'Faltan datos obligatorios' });
-    }
-
-    // Insertar en la tabla Opiniones
-    const [resultado] = await pool.query(
-      `INSERT INTO Opiniones (UsuarioNatural, Publicacion, NombreUsuario, Comentario, Calificacion)
-       VALUES (?, ?, ?, ?, ?)`,
-      [usuarioId, idPublicacion, nombreUsuario, comentario, calificacion]
-    );
-
-    res.json({
-      mensaje: '✅ Opinión guardada correctamente',
-      idOpinion: resultado.insertId
-    });
-
-  } catch (error) {
-    console.error('❌ Error al insertar opinión:', error);
-    res.status(500).json({ error: 'Error en el servidor al guardar la opinión.' });
-  }
-});
-
-// RESPONDER OPINIONES - COMERCIANTES
-app.post('/api/opiniones/responder', async (req, res) => {
-  try {
-    const { idOpinion, idComerciante, respuesta } = req.body;
-
-    if (!idOpinion || !idComerciante || !respuesta) {
-      return res.status(400).json({ error: 'Faltan datos obligatorios' });
-    }
-
-    // Verificar que la opinión existe y pertenece a una publicación del comerciante
-    const [opinion] = await pool.query(
-      `SELECT o.IdOpinion, p.Comerciante 
-       FROM opiniones o
-       JOIN publicacion p ON o.Publicacion = p.IdPublicacion
-       WHERE o.IdOpinion = ?`,
-      [idOpinion]
-    );
-
-    if (opinion.length === 0) {
-      return res.status(404).json({ error: 'Opinión no encontrada' });
-    }
-
-    // Verificar que el comerciante es el dueño de la publicación
-    const [comerciante] = await pool.query(
-      `SELECT NitComercio FROM comerciante WHERE Comercio = ?`,
-      [idComerciante]
-    );
-
-    if (comerciante.length === 0 || comerciante[0].NitComercio !== opinion[0].Comerciante) {
-      return res.status(403).json({ error: 'No tienes permiso para responder esta opinión' });
-    }
-
-    // Insertar la respuesta
-    const [resultado] = await pool.query(
-      `INSERT INTO respuestas_opiniones (IdOpinion, IdComerciante, Respuesta)
-       VALUES (?, ?, ?)`,
-      [idOpinion, idComerciante, respuesta]
-    );
-
-    res.json({
-      mensaje: '✅ Respuesta guardada correctamente',
-      idRespuesta: resultado.insertId
-    });
-
-  } catch (error) {
-    console.error('❌ Error al insertar respuesta:', error);
-    res.status(500).json({ error: 'Error en el servidor al guardar la respuesta.' });
-  }
-});
-
-// VER CARRITO DE COMPRAS DEL USUARIO LOGUEADO - NATURAL
-app.get('/api/carrito', async (req, res) => {
-  try {
-    const usuario = req.session.usuario;
-    if (!usuario) return res.status(401).json({ msg: 'No hay usuario en sesión' });
-
-    const [carrito] = await pool.query(`
-      SELECT 
-        c.IdCarrito,
-        p.NombreProducto,
-        p.Precio,
-        c.Cantidad,
-        (p.Precio * c.Cantidad) AS Total
-      FROM Carrito c
-      JOIN publicacion p ON c.Publicacion = p.IdPublicacion
-      WHERE c.UsuarioNat = ? AND c.Estado = 'Pendiente'
-    `, [usuario.id]);
-
-    res.json(carrito);
-  } catch (err) {
-    console.error('❌ Error al obtener el carrito:', err);
-    res.status(500).json({ msg: 'Error al obtener el carrito' });
-  }
-});
-
-
-// 🔄 Actualizar cantidad de un producto en el carrito
-app.put('/api/carrito/:id', async (req, res) => {
-  const { id } = req.params;
-  const { cantidad } = req.body;
-
-  try {
-    await pool.query(
-      `UPDATE Carrito SET Cantidad = ?, SubTotal = (Cantidad * SubTotal / Cantidad) WHERE IdCarrito = ?`,
-      [cantidad, id]
-    );
-    res.json({ msg: 'Cantidad actualizada' });
-  } catch (err) {
-    console.error('❌ Error al actualizar cantidad:', err);
-    res.status(500).json({ msg: 'Error al actualizar cantidad' });
-  }
-});
-
-
-// ❌ Eliminar producto del carrito
-app.delete('/api/carrito/:id', async (req, res) => {
-  const { id } = req.params;
-  try {
-    await pool.query('DELETE FROM Carrito WHERE IdCarrito = ?', [id]);
-    res.json({ msg: 'Producto eliminado' });
-  } catch (err) {
-    console.error('❌ Error al eliminar producto:', err);
-    res.status(500).json({ msg: 'Error al eliminar producto' });
-  }
-});
-
-
-
-
-// ✅ GET /api/proceso-compra
-app.get('/api/proceso-compra', async (req, res) => {
-  try {
-    // Asegúrate de que el usuario venga de la sesión
-    const usuarioSesion = req.session && req.session.usuario;
-    if (!usuarioSesion) {
-      return res.status(401).json({ msg: 'Usuario no autenticado' });
-    }
-    const idUsuarioNat = usuarioSesion.id;
-
-    const [rows] = await pool.query(
-      `SELECT
-         c.IdCarrito,
-         c.Cantidad,
-         -- Preferimos calcular subtotal aquí para evitar inconsistencias
-         (p.Precio * c.Cantidad) AS Subtotal,
-         p.Precio,
-         p.NombreProducto AS Producto,
-         c.SubTotal AS SubTotalEnCarrito,
-         cm.NombreComercio,
-         cm.Direccion AS DireccionComercio,
-         u.IdUsuario AS IdComercioUsuario,
-         u.Nombre AS NombreUsuarioComercio,
-         u.Apellido AS ApellidoUsuarioComercio
-       FROM Carrito c
-       JOIN publicacion p ON c.Publicacion = p.IdPublicacion
-       JOIN comerciante cm ON p.Comerciante = cm.NitComercio
-       JOIN usuario u ON cm.Comercio = u.IdUsuario
-       WHERE c.UsuarioNat = ? AND c.Estado = 'Pendiente'`,
-      [idUsuarioNat]
-    );
-
-    // Normalizar estructura que espera el frontend
-    const resultado = rows.map(r => ({
-      IdCarrito: r.IdCarrito,
-      Cantidad: Number(r.Cantidad),
-      Precio: Number(r.Precio),
-      Subtotal: Number(r.Subtotal),
-      Producto: r.Producto,
-      // info del comercio por si la necesitas
-      NombreComercio: r.NombreComercio,
-      DireccionComercio: r.DireccionComercio,
-      IdComercioUsuario: r.IdComercioUsuario,
-      NombreUsuarioComercio: r.NombreUsuarioComercio,
-      ApellidoUsuarioComercio: r.ApellidoUsuarioComercio
-    }));
-
-    res.json(resultado);
-  } catch (err) {
-    console.error('❌ Error en /api/proceso-compra:', err);
-    res.status(500).json({ msg: 'Error al obtener productos para proceso de compra' });
-  }
-});
-
-
-//PROCESO DE COMPRA//
-
-app.post("/api/finalizar-compra", async (req, res) => {
-  try {
-    console.log("📦 Finalizando compra...");
-
-    const usuarioSesion = req.session && req.session.usuario;
-    const usuarioId = (usuarioSesion && usuarioSesion.id) || req.body.usuarioId || null;
-    const metodoPago = req.body.metodoPago;
-    const compraDirecta = req.body.compraDirecta; // Nueva: compra directa desde detalle
-
-    console.log(`👤 Usuario: ${usuarioId}, 💳 Método: ${metodoPago}`);
-    console.log(`🛍️ Compra directa:`, compraDirecta ? 'SÍ' : 'NO');
-
-    if (!usuarioId || !metodoPago) {
-      console.log("⚠️ Faltan datos: usuario o método de pago");
-      return res.status(400).json({ message: "Faltan datos del usuario o método de pago." });
-    }
-
-    if (!['contraentrega', 'recoger'].includes(metodoPago)) {
-      console.log(`⚠️ Método de pago no válido: ${metodoPago}`);
-      return res.status(400).json({ message: "Método de pago no válido." });
-    }
-
-    let detallesParaInsertar = [];
-    let totalCompra = 0;
-
-    // 🆕 CASO 1: Compra directa (desde detalle de producto)
-    if (compraDirecta && compraDirecta.idPublicacion) {
-      console.log(`🛍️ Procesando compra directa del producto ID: ${compraDirecta.idPublicacion}`);
-
-      // Obtener datos completos del producto y comercio
-      const productoRows = await queryPromise(`
-        SELECT 
-          pub.IdPublicacion,
-          pub.NombreProducto, 
-          pub.Precio, 
-          pub.Comerciante AS Comercio
-        FROM publicacion pub
-        WHERE pub.IdPublicacion = ?
-      `, [compraDirecta.idPublicacion]);
-
-      if (!productoRows || productoRows.length === 0) {
-        return res.status(404).json({ message: "Producto no encontrado." });
-      }
-
-      const producto = productoRows[0];
-      const cantidad = compraDirecta.cantidad || 1;
-      const subtotal = Number(producto.Precio) * cantidad;
-
-      totalCompra = subtotal;
-      detallesParaInsertar.push({
-        publicacion: producto.IdPublicacion,
-        cantidad: cantidad,
-        precioUnitario: producto.Precio,
-        total: subtotal,
-        comercio: producto.Comercio
-      });
-
-      console.log(`✅ Producto directo: ${producto.NombreProducto}, Total: $${subtotal}`);
-    } 
-    // CASO 2: Compra desde carrito
-    else {
-      console.log("🛒 Procesando compra desde carrito...");
-
-      const carritoRows = await queryPromise(`
-        SELECT 
-          c.IdCarrito, 
-          c.Cantidad, 
-          pub.IdPublicacion,
-          pub.NombreProducto, 
-          pub.Precio, 
-          (pub.Precio * c.Cantidad) AS Subtotal,
-          pub.Comerciante AS Comercio
-        FROM carrito c
-        JOIN publicacion pub ON c.Publicacion = pub.IdPublicacion
-        WHERE c.UsuarioNat = ? AND c.Estado = 'Pendiente'
-      `, [usuarioId]);
-
-      if (!carritoRows || carritoRows.length === 0) {
-        console.log("⚠️ No hay productos en el carrito");
-        return res.status(400).json({ message: "No hay productos pendientes en el carrito." });
-      }
-
-      console.log(`📋 ${carritoRows.length} productos en el carrito`);
-
-      for (const item of carritoRows) {
-        totalCompra += Number(item.Subtotal);
-        detallesParaInsertar.push({
-          publicacion: item.IdPublicacion,
-          cantidad: item.Cantidad,
-          precioUnitario: item.Precio,
-          total: item.Subtotal,
-          comercio: item.Comercio
-        });
-      }
-    }
-
-    console.log(`💰 Total de la compra: $${totalCompra}`);
-
-    // 3️⃣ Insertar factura con estado "Proceso pendiente"
-    const insertFactura = await queryPromise(
-      `INSERT INTO factura (Usuario, TotalPago, MetodoPago, Estado, FechaCompra)
-       VALUES (?, ?, ?, ?, datetime('now'))`,
-      [usuarioId, totalCompra, metodoPago, 'Proceso pendiente']
-    );
-
-    const facturaId = insertFactura.lastID || insertFactura.insertId;
-    console.log(`✅ Factura creada con ID: ${facturaId}`);
-
-    // 4️⃣ Insertar detalles con estado "Pendiente"
-    for (const detalle of detallesParaInsertar) {
-      await queryPromise(
-        `INSERT INTO detallefactura (Factura, Publicacion, Cantidad, PrecioUnitario, Total, Estado)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [facturaId, detalle.publicacion, detalle.cantidad, detalle.precioUnitario, detalle.total, 'Pendiente']
-      );
-
-      const insertDetalleComercio = await queryPromise(
-        `INSERT INTO detallefacturacomercio (Factura, Publicacion, Cantidad, PrecioUnitario, Total, Estado)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [facturaId, detalle.publicacion, detalle.cantidad, detalle.precioUnitario, detalle.total, 'Pendiente']
-      );
-
-      const detalleComercioId = insertDetalleComercio.lastID || insertDetalleComercio.insertId;
-
-      let modoServicio = metodoPago === "recoger" ? "Visita al taller" : "Domicilio";
-      let tipoServicio = metodoPago === "recoger" ? 1 : 2;
-      let fecha = req.body.fechaRecoger || null;
-      let hora = req.body.horaRecoger || null;
-      let comentarios = req.body.comentariosRecoger || null;
-
-      await queryPromise(
-        `INSERT INTO controlagendacomercio 
-         (Comercio, DetFacturacomercio, TipoServicio, ModoServicio, FechaServicio, HoraServicio, ComentariosAdicionales)
-         VALUES (?, ?, ?, ?, ?, ?, ?)`,
-        [detalle.comercio, detalleComercioId, tipoServicio, modoServicio, fecha, hora, comentarios]
-      );
-    }
-
-    // 5️⃣ Vaciar carrito solo si NO fue compra directa
-    if (!compraDirecta) {
-      await queryPromise(`DELETE FROM carrito WHERE UsuarioNat = ?`, [usuarioId]);
-      console.log("🗑️ Carrito vaciado");
-    }
-
-    console.log("✅ Compra registrada con método:", metodoPago);
-
-    // 6️⃣ Mensaje final
-    let message = "";
-    let redirect = null;
-
-    if (metodoPago === "contraentrega") {
-      message = "Su proceso se registró con éxito. Puede hacer seguimiento en 'Historial'.";
-    } else if (metodoPago === "recoger") {
-      message = "Su solicitud fue enviada al comercio con éxito.";
-    }
-
-    return res.json({ success: true, message, redirect });
-
-  } catch (err) {
-    console.error("❌ Error al finalizar compra:", err);
-    res.status(500).json({ message: "Error al finalizar la compra", error: err.message });
-  }
-});
-
-// 🔹 API: Obtener factura por ID - APARTADO DE MOSTRAR FACTURA DESPUES DE COMPRA USUARIO NATURAL
-// ===============================
-app.get('/api/factura/:id', async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    // 1️⃣ Obtener datos de la factura y del comprador
-    const [facturaRows] = await pool.query(`
-      SELECT 
-        f.IdFactura,
-        f.FechaCompra,
-        f.TotalPago,
-        f.MetodoPago,
-        f.Estado,
-        u.Nombre AS NombreUsuario,
-        u.Apellido AS ApellidoUsuario,
-        u.Telefono,
-        u.Correo
-      FROM factura f
-      LEFT JOIN usuario u ON f.Usuario = u.IdUsuario
-      WHERE f.IdFactura = ?
-    `, [id]);
-
-    if (facturaRows.length === 0) {
-      return res.status(404).json({ msg: 'Factura no encontrada' });
-    }
-
-    const factura = facturaRows[0];
-
-    // 2️⃣ Obtener los productos asociados a la factura con datos del comercio
-    const [detalleRows] = await pool.query(`
-      SELECT 
-        p.NombreProducto,
-        df.Cantidad,
-        df.PrecioUnitario,
-        df.Total,
-        com.NombreComercio,
-        com.Direccion AS DireccionComercio
-      FROM detallefactura df
-      JOIN publicacion p ON df.Publicacion = p.IdPublicacion
-      LEFT JOIN comerciante com ON p.Comerciante = com.NitComercio
-      WHERE df.Factura = ?
-    `, [id]);
-
-    // 3️⃣ Enviar la respuesta
-    res.json({
-      factura,
-      detalles: detalleRows
-    });
-
-  } catch (error) {
-    console.error('❌ Error al obtener factura:', error);
-    res.status(500).json({ msg: 'Error al obtener factura' });
-  }
-});
-
-//------------------//
-//SECCION GENERAL //
-//------------------//
-
-//APARTADO DE CENTRO DE AYUDA
-
-app.post("/api/centro-ayuda", async (req, res) => {
-  const { perfil, tipoSolicitud, rol, asunto, descripcion } = req.body;
-
-  console.log('📩 Solicitud de centro de ayuda recibida:', { perfil, tipoSolicitud, rol, asunto });
-
-  // Validación de datos
-  if (!perfil) {
-    console.log('⚠️ Perfil no proporcionado');
-    return res.status(401).json({ error: "Debes iniciar sesión para hacer esta solicitud." });
-  }
-
-  // Validación de rol
-  const rolesValidos = ["Usuario Natural", "Comerciante", "PrestadorServicio"];
-  if (!rolesValidos.includes(rol)) {
-    console.log('⚠️ Rol inválido:', rol);
-    return res.status(400).json({ error: "Rol inválido. Selecciona una opción válida." });
-  }
-
-  try {
-    const sql = `
-      INSERT INTO centroayuda (Perfil, TipoSolicitud, Rol, Asunto, Descripcion)
-      VALUES (?, ?, ?, ?, ?)
-    `;
-    await queryPromise(sql, [perfil, tipoSolicitud, rol, asunto, descripcion]);
-
-    console.log('✅ Solicitud de ayuda registrada exitosamente');
-    res.status(200).json({ message: "Solicitud registrada con éxito." });
-  } catch (error) {
-    console.error("❌ Error al insertar solicitud de ayuda:", error);
-    res.status(500).json({ error: "Error al guardar la solicitud." });
-  }
-});
-
-
-
-//----------///
-// SECCION DE PRESTADOR DE SERVICIOS//
-//-----------//
-// ===============================
-//  Perfil del Prestador de Servicios
-app.get('/api/perfil-prestador', async (req, res) => {
-  const usuarioSesion = req.session.usuario;
-  if (!usuarioSesion || usuarioSesion.tipo !== "PrestadorServicio") {
-    return res.status(401).json({ error: "No autorizado. Debes iniciar sesión como prestador de servicios." });
-  }
-
-  try {
-    console.log("📊 Cargando perfil del prestador:", usuarioSesion.id);
-
-    // 🔍 Datos del usuario
-    const userRows = await queryPromise(
-      `SELECT u.IdUsuario, u.Nombre, u.Documento, u.FotoPerfil
-       FROM usuario u
-       WHERE u.IdUsuario = ?`,
-      [usuarioSesion.id]
-    );
-
-    if (userRows.length === 0) {
-      return res.status(404).json({ error: "Usuario no encontrado" });
-    }
-
-    const user = userRows[0];
-
-    // 🖼️ Ruta de imagen
-    let tipoCarpeta = usuarioSesion.tipo;
-    if (tipoCarpeta === "PrestadorServicio") {
-      tipoCarpeta = "PrestadorServicios"; // ✅ Corrección de nombre de carpeta
-    }
-
-    const rutaCarpeta = path.join(__dirname, 'public', 'imagen', tipoCarpeta, user.Documento.toString());
-    let fotoRutaFinal = '/imagen/imagen_perfil.png'; // por defecto
-
-    if (fs.existsSync(rutaCarpeta)) {
-      const archivos = fs.readdirSync(rutaCarpeta);
-      const archivoFoto = archivos.find(
-        f => f.includes(user.FotoPerfil) || f.match(/\.(jpg|jpeg|png|webp)$/i)
-      );
-      if (archivoFoto) {
-        fotoRutaFinal = `/imagen/${tipoCarpeta}/${user.Documento}/${archivoFoto}`;
-      }
-    } else {
-      console.warn(`⚠️ Carpeta de usuario no encontrada: ${rutaCarpeta}`);
-    }
-
-    // 📊 Obtener IdServicio del prestador
-    const servicioRows = await queryPromise(
-      `SELECT IdServicio FROM prestadorservicio WHERE Usuario = ?`,
-      [usuarioSesion.id]
-    );
-
-    let idServicio = null;
-    if (servicioRows.length > 0) {
-      idServicio = servicioRows[0].IdServicio;
-    }
-
-    // 📊 Calcular estadísticas desde OpinionesGrua
-    let valoracionPromedio = "N/A";
-    let totalOpiniones = 0;
-
-    if (idServicio) {
-      const opinionesRows = await queryPromise(
-        `SELECT AVG(og.Calificacion) AS promedio, COUNT(*) AS total
-         FROM opinionesgrua og
-         JOIN publicaciongrua pg ON og.PublicacionGrua = pg.IdPublicacionGrua
-         WHERE pg.Servicio = ?`,
-        [idServicio]
-      );
-
-      if (opinionesRows.length > 0 && opinionesRows[0].promedio) {
-        valoracionPromedio = parseFloat(opinionesRows[0].promedio).toFixed(1);
-        totalOpiniones = opinionesRows[0].total;
-      }
-    }
-
-    // 📋 Contar servicios agendados (pendientes, aceptados y completados)
-    let pendientes = 0;
-    let aceptados = 0;
-    let completados = 0;
-
-    if (idServicio) {
-      const agendaRows = await queryPromise(
-        `SELECT 
-           SUM(CASE WHEN cas.Estado = 'Pendiente' THEN 1 ELSE 0 END) AS pendientes,
-           SUM(CASE WHEN cas.Estado = 'Aceptado' THEN 1 ELSE 0 END) AS aceptados,
-           SUM(CASE WHEN cas.Estado IN ('Terminado', 'Completado') THEN 1 ELSE 0 END) AS completados
-         FROM controlagendaservicios cas
-         JOIN publicaciongrua pg ON cas.PublicacionGrua = pg.IdPublicacionGrua
-         WHERE pg.Servicio = ?`,
-        [idServicio]
-      );
-
-      if (agendaRows.length > 0) {
-        pendientes = agendaRows[0].pendientes || 0;
-        aceptados = agendaRows[0].aceptados || 0;
-        completados = agendaRows[0].completados || 0;
-      }
-    }
-
-    // 📋 Últimas solicitudes de agenda de grúa
-    const solicitudesRows = idServicio ? await queryPromise(
-      `SELECT 
-         cas.IdSolicitudServicio,
-         u.Nombre AS Cliente,
-         cas.DireccionRecogida AS Origen,
-         cas.Destino AS Destino,
-         cas.FechaServicio AS Fecha,
-         cas.Estado
-       FROM controlagendaservicios cas
-       JOIN publicaciongrua pg ON cas.PublicacionGrua = pg.IdPublicacionGrua
-       JOIN usuario u ON cas.UsuarioNatural = u.IdUsuario
-       WHERE pg.Servicio = ?
-       ORDER BY cas.FechaServicio DESC
-       LIMIT 5`,
-      [idServicio]
-    ) : [];
-
-    // ✅ Respuesta
-    res.json({
-      nombre: user.Nombre,
-      foto: fotoRutaFinal,
-      descripcion: "Prestador de servicio de grúa 24/7",
-      estadisticas: {
-        totalServicios: pendientes + aceptados + completados,
-        pendientes: pendientes,
-        aceptados: aceptados,
-        completados: completados,
-        valoracion: valoracionPromedio
-      },
-      solicitudes: solicitudesRows
-    });
-
-    console.log("✅ Perfil del prestador cargado correctamente");
-
-  } catch (err) {
-    console.error("❌ Error en perfil del prestador:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-// ===============================
-//  PUBLICACIONES GRUAS
-
-// 📦 Configuración específica para publicaciones de grúa
-const storagePublicacionPrestador = multer.diskStorage({
-  destination: (req, file, cb) => {
-    const usuario = req.session.usuario;
-    const dir = path.join(__dirname, 'public', 'Publicaciones', usuario.id.toString());
-
-    if (!fs.existsSync(dir)) {
-      fs.mkdirSync(dir, { recursive: true });
-    }
-
-    cb(null, dir);
-  },
-  filename: (req, file, cb) => {
-    const nombreUnico = Date.now() + '-' + Math.round(Math.random() * 1e9) + path.extname(file.originalname);
-    cb(null, nombreUnico);
-  }
-});
-
-const uploadPublicacionPrestador = multer({
-  storage: storagePublicacionPrestador,
-  limits: { fileSize: 5 * 1024 * 1024 }
-});
-
-
-
-app.post('/api/publicar-grua', uploadPublicacionPrestador.array('imagenesGrua', 5), async (req, res) => {
-  const usuario = req.session.usuario;
-
-  // 🔒 Validación de acceso
-  if (!usuario || usuario.tipo !== 'PrestadorServicio') {
-    cleanupTempFiles(req.files, tempDirGrua);
-    return res.status(403).json({ error: 'Acceso no autorizado. Solo prestadores pueden publicar.' });
-  }
-
-  const { titulo, descripcion, tarifa, zona } = req.body;
-
-  // 🧩 Validar campos
-  if (!titulo || !descripcion || !tarifa || !zona) {
-    cleanupTempFiles(req.files, tempDirGrua);
-    return res.status(400).json({ error: 'Faltan datos obligatorios.' });
-  }
-
-  try {
-    // 🔹 Obtener ID del servicio del prestador
-    const [rowsServicio] = await pool.query(
-      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1',
-      [usuario.id]
-    );
-
-    if (rowsServicio.length === 0) {
-      cleanupTempFiles(req.files, tempDirGrua);
-      return res.status(404).json({ error: 'No se encontró el servicio asociado al usuario.' });
-    }
-
-    const idServicio = rowsServicio[0].IdServicio;
-
-    // 🔹 Insertar publicación sin imágenes aún
-    const [resultPub] = await pool.query(
-      `INSERT INTO publicaciongrua (Servicio, TituloPublicacion, DescripcionServicio, TarifaBase, ZonaCobertura, FotoPublicacion)
-       VALUES (?, ?, ?, ?, ?, '')`,
-      [idServicio, titulo, descripcion, tarifa, zona]
-    );
-
-    const idPublicacion = resultPub.insertId;
-    console.log('✅ Publicación de grúa creada con ID:', idPublicacion);
-
-    // 🔹 Crear carpeta de la publicación
-    const carpetaPublicacion = path.join(
-      process.cwd(),
-      'public', 'imagen', 'PrestadorServicios', usuario.id.toString(), 'publicaciones', idPublicacion.toString()
-    );
-    fs.mkdirSync(carpetaPublicacion, { recursive: true });
-
-    // 🔹 Mover imágenes desde temp a carpeta específica
-    const imagenes = [];
-
-    if (Array.isArray(req.files) && req.files.length > 0) {
-      req.files.forEach(file => {
-        const destino = path.join(carpetaPublicacion, file.filename);
-        fs.renameSync(file.path, destino);
-
-        const rutaRelativa = path.posix.join(
-          'imagen',
-          'PrestadorServicios',
-          usuario.id.toString(),
-          'publicaciones',
-          idPublicacion.toString(),
-          file.filename
-        );
-
-        imagenes.push(rutaRelativa);
-      });
-    }
-
-    // ✅ Guardar todas las rutas como JSON en FotoPublicacion
-    const imagenFinal = imagenes.length > 0
-      ? JSON.stringify(imagenes)
-      : JSON.stringify(['/imagen/default_grua.jpg']);
-
-    await pool.query(
-      'UPDATE publicaciongrua SET FotoPublicacion = ? WHERE IdPublicacionGrua = ?',
-      [imagenFinal, idPublicacion]
-    );
-
-    res.json({ mensaje: '✅ Publicación de grúa creada exitosamente', idPublicacion });
-
-  } catch (err) {
-    console.error('❌ Error en /api/publicar-grua:', err);
-    cleanupTempFiles(req.files, tempDirGrua);
-    res.status(500).json({ error: 'Error al registrar la publicación.' });
-  }
-});
-
-/// REGISTRO O HISTORIAL DE PUBLICACIONES GRUAS//
-
-app.get('/api/publicaciones-grua', async (req, res) => {
-  try {
-    const usuario = req.session.usuario;
-
-    if (!usuario || usuario.tipo !== 'PrestadorServicio') {
-      return res.status(403).json({ error: 'Acceso no autorizado. Solo prestadores pueden ver sus publicaciones.' });
-    }
-
-    const [servicio] = await pool.query(
-      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1',
-      [usuario.id]
-    );
-
-    if (!servicio || servicio.length === 0) {
-      return res.status(404).json({ error: 'No se encontró el servicio asociado.' });
-    }
-
-    const idServicio = servicio[0].IdServicio;
-
-    const [publicaciones] = await pool.query(
-      `SELECT 
-         IdPublicacionGrua, 
-         TituloPublicacion, 
-         DescripcionServicio, 
-         TarifaBase, 
-         ZonaCobertura, 
-         FotoPublicacion
-       FROM publicaciongrua
-       WHERE Servicio = ?
-       ORDER BY IdPublicacionGrua DESC`,
-      [idServicio]
-    );
-
-    res.json(publicaciones);
-  } catch (err) {
-    console.error('❌ Error al obtener publicaciones de grúa:', err);
-    res.status(500).json({ error: 'Error interno al obtener las publicaciones.' });
-  }
-});
-
-//ELIMINAR UNA PUBLICACION DE GRUA
-
-app.delete('/api/publicaciones-grua/:id', async (req, res) => {
-  try {
-    const usuario = req.session.usuario;
-    const idPublicacion = req.params.id;
-
-    if (!usuario || usuario.tipo !== 'PrestadorServicio') {
-      return res.status(403).json({ error: 'Acceso no autorizado. Solo prestadores pueden eliminar publicaciones.' });
-    }
-
-    // 🔹 1️⃣ Obtener el ID del servicio del prestador
-    const [servicio] = await pool.query(
-      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1',
-      [usuario.id]
-    );
-
-    if (!servicio || servicio.length === 0) {
-      return res.status(404).json({ error: 'No se encontró el servicio asociado.' });
-    }
-
-    const idServicio = servicio[0].IdServicio;
-
-    // 🔹 2️⃣ Verificar que la publicación exista y obtener las imágenes
-    const [publicacion] = await pool.query(
-      'SELECT FotoPublicacion FROM publicaciongrua WHERE IdPublicacionGrua = ? AND Servicio = ?',
-      [idPublicacion, idServicio]
-    );
-
-    if (!publicacion || publicacion.length === 0) {
-      return res.status(404).json({ error: 'No se encontró la publicación o no pertenece a tu servicio.' });
-    }
-
-    let imagenes = [];
-    try {
-      imagenes = JSON.parse(publicacion[0].FotoPublicacion || '[]');
-    } catch (parseErr) {
-      console.warn('⚠️ No se pudieron parsear las imágenes:', parseErr);
-    }
-
-    // 🔹 3️⃣ Eliminar la publicación
-    await pool.query(
-      'DELETE FROM publicaciongrua WHERE IdPublicacionGrua = ? AND Servicio = ?',
-      [idPublicacion, idServicio]
-    );
-
-    // 🔹 4️⃣ Eliminar carpeta completa de la publicación
-    const carpetaPublicacion = path.join(
-      __dirname,
-      'public',
-      'imagen',
-      'PrestadorServicios',
-      usuario.id.toString(),
-      'publicaciones',
-      idPublicacion.toString()
-    );
-
-    try {
-      if (fs.existsSync(carpetaPublicacion)) {
-        fs.rmSync(carpetaPublicacion, { recursive: true, force: true });
-        console.log(`🗑️ Carpeta eliminada correctamente: ${carpetaPublicacion}`);
-      } else {
-        console.warn('⚠️ Carpeta no encontrada (posiblemente ya eliminada):', carpetaPublicacion);
-      }
-    } catch (fsErr) {
-      console.error('❌ Error al eliminar carpeta:', fsErr);
-    }
-
-    // 🔹 5️⃣ Confirmar eliminación
-    res.json({
-      mensaje: '✅ Publicación y carpeta eliminadas exitosamente.'
-    });
-
-  } catch (err) {
-    console.error('❌ Error al eliminar publicación de grúa:', err);
-    res.status(500).json({ error: 'Error interno al eliminar la publicación.' });
-  }
-});
-
-
-
-//APARTADO DE EDITAR PUBLICACION GRUA - OBTENER DATOS PARA EDICIÓN
-app.get('/api/publicaciones-grua/editar/:id', async (req, res) => {
-  console.log("📥 Solicitud recibida para editar publicación");
-  console.log("🔐 Usuario en sesión:", req.session.usuario);
-  console.log("🔍 ID solicitado:", req.params.id);
-
-  try {
-    const usuario = req.session.usuario;
-    const idPublicacion = req.params.id;
-
-    if (!usuario || usuario.tipo !== 'PrestadorServicio') {
-      return res.status(403).json({ error: 'Acceso no autorizado.' });
-    }
-
-    const servicioRows = await queryPromise(
-      'SELECT IdServicio FROM prestadorservicio WHERE Usuario = ? LIMIT 1',
-      [usuario.id]
-    );
-
-    if (servicioRows.length === 0) {
-      return res.status(404).json({ error: 'No se encontró el servicio asociado.' });
-    }
-
-    const idServicio = servicioRows[0].IdServicio;
-
-    const publicacionRows = await queryPromise(
-      `SELECT 
-        pg.IdPublicacionGrua,
-        pg.TituloPublicacion,
-        pg.DescripcionServicio,
-        pg.TarifaBase,
-        pg.ZonaCobertura,
-        pg.FotoPublicacion
-      FROM publicaciongrua pg
-      WHERE pg.IdPublicacionGrua = ? AND pg.Servicio = ?
-      LIMIT 1`,
-      [idPublicacion, idServicio]
-    );
-
-    if (publicacionRows.length === 0) {
-      return res.status(404).json({ error: 'Publicación no encontrada o no pertenece al prestador.' });
-    }
-
-    const pub = publicacionRows[0];
-    try {
-      pub.FotoPublicacion = JSON.parse(pub.FotoPublicacion || '[]');
-    } catch {
-      pub.FotoPublicacion = [];
-    }
-
-    res.json(pub);
-  } catch (err) {
-    console.error('❌ Error al obtener publicación de grúa:', err);
-    res.status(500).json({ error: 'Error interno al obtener la publicación.' });
-  }
-});
-
-///MODIFICAR Y/O ACTUALIZAR PUBLICACION
-
-app.put('/api/publicaciones-grua/:id', uploadPublicacionPrestador.array('imagenesNuevas', 5), async (req, res) => {
-  const usuario = req.session.usuario;
-  const idPublicacion = req.params.id;
-
-  if (!usuario || usuario.tipo !== 'PrestadorServicio') {
-    cleanupTempFiles(req.files, tempDirGrua);
-    return res.status(403).json({ error: 'Acceso no autorizado.' });
-  }
-
-  const { titulo, descripcion, tarifa, zona, imagenesActuales } = req.body;
-
-  if (!titulo || !descripcion || !tarifa || !zona) {
-    cleanupTempFiles(req.files, tempDirGrua);
-    return res.status(400).json({ error: 'Faltan datos obligatorios.' });
-  }
-
-  try {
-    const [servicioRows] = await pool.query(
-      'SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1',
-      [usuario.id]
-    );
-
-    if (servicioRows.length === 0) {
-      cleanupTempFiles(req.files, tempDirGrua);
-      return res.status(404).json({ error: 'No se encontró el servicio asociado.' });
-    }
-
-    const idServicio = servicioRows[0].IdServicio;
-
-    const [verificacion] = await pool.query(
-      'SELECT IdPublicacionGrua FROM publicaciongrua WHERE IdPublicacionGrua = ? AND Servicio = ?',
-      [idPublicacion, idServicio]
-    );
-
-    if (verificacion.length === 0) {
-      cleanupTempFiles(req.files, tempDirGrua);
-      return res.status(404).json({ error: 'Publicación no encontrada o no pertenece al prestador.' });
-    }
-
-    await pool.query(
-      `UPDATE publicaciongrua 
-       SET TituloPublicacion = ?, DescripcionServicio = ?, TarifaBase = ?, ZonaCobertura = ?
-       WHERE IdPublicacionGrua = ?`,
-      [titulo, descripcion, tarifa, zona, idPublicacion]
-    );
-
-    const carpetaPublicacion = path.join(
-      process.cwd(),
-      'public', 'imagen', 'PrestadorServicios', usuario.id.toString(), 'publicaciones', idPublicacion.toString()
-    );
-    fs.mkdirSync(carpetaPublicacion, { recursive: true });
-
-    // Parsear las imágenes actuales que NO se eliminaron
-    let imagenesMantenidas = [];
-    try {
-      imagenesMantenidas = imagenesActuales ? JSON.parse(imagenesActuales) : [];
-    } catch (e) {
-      imagenesMantenidas = [];
-    }
-
-    const nuevasImagenes = [...imagenesMantenidas];
-
-    if (Array.isArray(req.files) && req.files.length > 0) {
-      req.files.forEach(file => {
-        const destino = path.join(carpetaPublicacion, file.filename);
-        fs.renameSync(file.path, destino);
-
-        const rutaRelativa = path.posix.join(
-          'imagen',
-          'PrestadorServicios',
-          usuario.id.toString(),
-          'publicaciones',
-          idPublicacion.toString(),
-          file.filename
-        );
-
-        nuevasImagenes.push(rutaRelativa);
-      });
-    }
-
-    // Actualizar con todas las imágenes (mantenidas + nuevas)
-    await pool.query(
-      'UPDATE publicaciongrua SET FotoPublicacion = ? WHERE IdPublicacionGrua = ?',
-      [JSON.stringify(nuevasImagenes), idPublicacion]
-    );
-
-    res.json({ mensaje: '✅ Publicación actualizada correctamente' });
-
-  } catch (err) {
-    console.error('❌ Error al actualizar publicación:', err);
-    cleanupTempFiles(req.files, tempDirGrua);
-    res.status(500).json({ error: 'Error interno al actualizar la publicación.' });
-  }
-});
-
-/// EDITAR PERFIL PRESTADOR //
-
-
-app.get("/api/perfilPrestador/:idUsuario", async (req, res) => {
-  const { idUsuario } = req.params;
-
-  try {
-    const [rows] = await pool.query(
-      `SELECT Nombre, Correo, Telefono, FotoPerfil FROM Usuario WHERE IdUsuario = ?`,
-      [idUsuario]
-    );
-
-    if (rows.length === 0) {
-      return res.status(404).json({ error: "Usuario no encontrado" });
-    }
-
-    res.json(rows[0]);
-  } catch (error) {
-    console.error("❌ Error al obtener perfil prestador:", error);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-//ACTUALIZAR PERFIL PRESTADOR //
-
-app.put("/api/actualizarPerfilPrestador/:idUsuario", uploadPublicacionPrestador.fields([
-  { name: "FotoPerfil", maxCount: 1 },
-  { name: "Certificado", maxCount: 1 }
-]), async (req, res) => {
-  const { idUsuario } = req.params;
-  const data = req.body || {};
-  const foto = req.files?.FotoPerfil?.[0] || null;
-  const certificado = req.files?.Certificado?.[0] || null;
-
-  try {
-    const [usuarioRows] = await pool.query(
-      "SELECT Nombre, Apellido, Correo, Telefono, FotoPerfil FROM Usuario WHERE IdUsuario = ?",
-      [idUsuario]
-    );
-
-    if (usuarioRows.length === 0) {
-      return res.status(404).json({ error: "Usuario no encontrado" });
-    }
-
-    const datosActuales = usuarioRows[0];
-    let rutaFotoFinal = datosActuales.FotoPerfil;
-
-    // ✅ Procesar imagen de perfil
-    if (foto) {
-      const folder = path.join(__dirname, "public", "imagen", "PrestadorServicios", idUsuario);
-      fs.mkdirSync(folder, { recursive: true });
-
-      // Eliminar foto anterior
-      if (rutaFotoFinal) {
-        const rutaAnterior = path.join(__dirname, "public", rutaFotoFinal);
-        if (fs.existsSync(rutaAnterior)) {
-          fs.unlinkSync(rutaAnterior);
-          console.log(`🗑️ Foto anterior eliminada: ${rutaAnterior}`);
-        }
-      }
-
-      const nombreFoto = `${Date.now()}_${Math.round(Math.random() * 1e6)}${path.extname(foto.originalname)}`;
-      const destino = path.join(folder, nombreFoto);
-      fs.renameSync(foto.path, destino);
-
-      rutaFotoFinal = path.join("imagen", "PrestadorServicios", idUsuario, nombreFoto).replace(/\\/g, "/");
-      console.log(`✅ Nueva foto guardada: ${rutaFotoFinal}`);
-    }
-    
-    // ✅ Procesar certificado
-    let rutaCertificadoFinal = null;
-    if (certificado) {
-      const folder = path.join(__dirname, "public", "Imagen", "PrestadorServicios", idUsuario, "documentos");
-      fs.mkdirSync(folder, { recursive: true });
-
-      // Obtener ruta anterior desde prestadorservicio
-      const [servicioRows] = await pool.query(
-        "SELECT IdServicio, Certificado FROM prestadorservicio WHERE usuario = ? LIMIT 1",
-        [idUsuario]
-      );
-
-      if (servicioRows.length === 0) {
-        return res.status(404).json({ error: "No se encontró el servicio asociado al usuario." });
-      }
-
-      const idServicio = servicioRows[0].IdServicio;
-      const rutaCertificadoAnterior = servicioRows[0].Certificado;
-
-      // Eliminar certificado anterior
-      if (rutaCertificadoAnterior) {
-        const rutaCompleta = path.join(__dirname, "public", rutaCertificadoAnterior);
-        if (fs.existsSync(rutaCompleta)) {
-          fs.unlinkSync(rutaCompleta);
-          console.log(`🗑️ Certificado anterior eliminado`);
-        }
-      }
-
-      const nombreCertificado = `${Date.now()}_${Math.round(Math.random() * 1e6)}${path.extname(certificado.originalname)}`;
-      const destino = path.join(folder, nombreCertificado);
-      fs.renameSync(certificado.path, destino);
-
-      rutaCertificadoFinal = path.join("Imagen", "PrestadorServicios", idUsuario, "documentos", nombreCertificado).replace(/\\/g, "/");
-
-      await pool.query(
-        "UPDATE prestadorservicio SET Certificado = ? WHERE IdServicio = ?",
-        [rutaCertificadoFinal, idServicio]
-      );
-    }
-
-    // ✅ Actualizar datos en la base
-    await pool.query(
-      `UPDATE Usuario 
-      SET Nombre = ?, Apellido = ?, Correo = ?, Telefono = ?, FotoPerfil = ?
-      WHERE IdUsuario = ?`,
-      [
-        data.Nombre || datosActuales.Nombre,
-        data.Apellido || datosActuales.Apellido,
-        data.Correo || datosActuales.Correo,
-        data.Telefono || datosActuales.Telefono,
-        rutaFotoFinal,
-        idUsuario
-      ]
-    );
-
-    console.log(`✅ Perfil prestador actualizado para usuario: ${idUsuario}`);
-
-    res.json({ mensaje: "✅ Perfil actualizado correctamente", fotoPerfil: rutaFotoFinal, certificado: rutaCertificadoFinal });
-
-  } catch (error) {
-    console.error("❌ Error al actualizar perfil prestador:", error);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-//HISTORIAL DE SERVICIOS -  PRESTADOR//
-
-app.get("/api/historial-servicios/:idPrestador", async (req, res) => {
-  const { idPrestador } = req.params;
-
-  try {
-    const [servicioRows] = await pool.query(
-      "SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1",
-      [idPrestador]
-    );
-
-    if (servicioRows.length === 0) {
-      return res.status(404).json({ error: "Prestador no encontrado" });
-    }
-
-    const idServicio = servicioRows[0].IdServicio;
-
-    const [historial] = await pool.query(
-      `SELECT 
-         hs.IdHistorial,
-         u.Nombre AS Cliente,
-         pg.TituloPublicacion AS Servicio,
-         CONCAT(cas.DireccionRecogida, IF(cas.Destino IS NOT NULL, CONCAT(' → ', cas.Destino), '')) AS Ubicacion,
-         cas.FechaServicio AS Fecha,
-         cas.Estado,
-         pg.TarifaBase AS Total
-       FROM historialservicios hs
-       JOIN controlagendaservicios cas ON hs.SolicitudServicio = cas.IdSolicitudServicio
-       JOIN publicaciongrua pg ON cas.PublicacionGrua = pg.IdPublicacionGrua
-       JOIN usuario u ON cas.UsuarioNatural = u.IdUsuario
-       WHERE pg.Servicio = ?
-       ORDER BY cas.FechaServicio DESC`,
-      [idServicio]
-    );
-
-    res.json(historial);
-  } catch (err) {
-    console.error("❌ Error al obtener historial de servicios:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-//AGENDA DE SERVICIOS/SOLICITUDES - USUARIO PRESTADOR//
-app.get("/api/solicitudes-grua/:idPrestador", async (req, res) => {
-  const { idPrestador } = req.params;
-
-  try {
-    const servicioRows = await queryPromise(
-      "SELECT IdServicio FROM prestadorservicio WHERE usuario = ? LIMIT 1",
-      [idPrestador]
-    );
-
-    if (servicioRows.length === 0) {
-      return res.status(404).json({ error: "Prestador no encontrado" });
-    }
-
-    const idServicio = servicioRows[0].IdServicio;
-
-    const solicitudes = await queryPromise(
-      `SELECT 
-         cas.IdSolicitudServicio,
-         u.Nombre AS Cliente,
-         pg.TituloPublicacion AS Servicio,
-         cas.DireccionRecogida,
-         cas.Destino,
-         cas.FechaServicio,
-         cas.Estado,
-         cas.ComentariosAdicionales
-       FROM controlagendaservicios cas
-       JOIN publicaciongrua pg ON cas.PublicacionGrua = pg.IdPublicacionGrua
-       JOIN usuario u ON cas.UsuarioNatural = u.IdUsuario
-       WHERE pg.Servicio = ?
-       ORDER BY cas.FechaServicio DESC`,
-      [idServicio]
-    );
-
-    res.json(solicitudes);
-  } catch (err) {
-    console.error("❌ Error al obtener solicitudes:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-// ===============================
-//  ACTUALIZAR ESTADO DE SOLICITUD DE GRÚA - PRESTADOR
-// ===============================
-app.put('/api/solicitudes-grua/estado/:id', async (req, res) => {
-  const { id } = req.params;
-  const { estado } = req.body;
-
-  // Validar que el estado sea válido
-  const estadosValidos = ['Aceptado', 'Rechazado', 'Cancelado', 'Terminado', 'Finalizado', 'Completado'];
-  
-  if (!estadosValidos.includes(estado)) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Estado no válido. Debe ser: Aceptado, Rechazado, Cancelado, Terminado, Finalizado o Completado' 
-    });
-  }
-
-  try {
-    // Verificar que la solicitud existe y obtener su estado actual
-    const solicitud = await queryPromise(
-      'SELECT IdSolicitudServicio, Estado FROM controlagendaservicios WHERE IdSolicitudServicio = ?',
-      [id]
-    );
-
-    if (!solicitud || solicitud.length === 0) {
-      return res.status(404).json({ success: false, message: 'Solicitud no encontrada.' });
-    }
-
-    const estadoActual = solicitud[0].Estado;
-
-    // Validar que no se puede modificar un servicio ya finalizado o cancelado
-    if (['Completado', 'Terminado', 'Cancelado', 'Rechazado'].includes(estadoActual)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: `No se puede modificar un servicio que ya está ${estadoActual.toLowerCase()}.` 
-      });
-    }
-
-    // Validar transiciones de estado
-    if ((estado === 'Terminado' || estado === 'Finalizado' || estado === 'Completado') && estadoActual !== 'Aceptado') {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Solo puedes marcar como completado un servicio que ha sido aceptado.' 
-      });
-    }
-
-    // Normalizar estados: Terminado/Finalizado -> Completado
-    let estadoFinal = estado;
-    if (estado === 'Terminado' || estado === 'Finalizado') {
-      estadoFinal = 'Completado';
-    }
-
-    // Actualizar el estado
-    await queryPromise(
-      'UPDATE controlagendaservicios SET Estado = ? WHERE IdSolicitudServicio = ?',
-      [estadoFinal, id]
-    );
-
-    res.status(200).json({
-      success: true,
-      message: `Solicitud #${id} ${estadoFinal.toLowerCase()} correctamente.`
-    });
-
-  } catch (error) {
-    console.error('❌ Error al actualizar estado de solicitud:', error);
-    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
-  }
-});
-
-// ===============================
-//  ACTUALIZAR FECHA/HORA DE SOLICITUD DE GRÚA - PRESTADOR
-// ===============================
-app.put('/api/solicitudes-grua/fecha/:id', async (req, res) => {
-  const { id } = req.params;
-  const { fecha, hora } = req.body;
-
-  if (!fecha || !hora) {
-    return res.status(400).json({ 
-      success: false, 
-      message: 'Fecha y hora son obligatorias.' 
-    });
-  }
-
-  try {
-    // Verificar que la solicitud existe y obtener su estado
-    const solicitud = await queryPromise(
-      'SELECT IdSolicitudServicio, Estado FROM controlagendaservicios WHERE IdSolicitudServicio = ?',
-      [id]
-    );
-
-    if (!solicitud || solicitud.length === 0) {
-      return res.status(404).json({ success: false, message: 'Solicitud no encontrada.' });
-    }
-
-    const estadoActual = solicitud[0].Estado;
-
-    // Validar que solo se puede modificar si está Pendiente o Aceptado
-    if (!['Pendiente', 'Aceptado'].includes(estadoActual)) {
-      return res.status(400).json({ 
-        success: false, 
-        message: 'Solo puedes modificar la fecha de servicios pendientes o aceptados.' 
-      });
-    }
-
-    // Actualizar fecha y hora, registrar modificación y resetear notificación
-    // Usar datetime('now') para SQLite o NOW() para MySQL
-    const fechaActual = new Date().toISOString().replace('T', ' ').substring(0, 19);
-    await queryPromise(
-      'UPDATE controlagendaservicios SET FechaServicio = ?, HoraServicio = ?, FechaModificadaPor = ?, NotificacionVista = 0 WHERE IdSolicitudServicio = ?',
-      [fecha, hora, fechaActual, id]
-    );
-
-    res.status(200).json({
-      success: true,
-      message: `Fecha y hora actualizadas correctamente para la solicitud #${id}. El usuario será notificado del cambio.`
-    });
-
-  } catch (error) {
-    console.error('❌ Error al actualizar fecha/hora de solicitud:', error);
-    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
-  }
-});
-
-// 🔹 Marcar notificación de cambio de fecha como vista
-app.put('/api/solicitudes-grua/notificacion-vista/:id', async (req, res) => {
-  const { id } = req.params;
-
-  try {
-    // Usar 1 para SQLite en lugar de TRUE
-    await queryPromise(
-      'UPDATE controlagendaservicios SET NotificacionVista = 1 WHERE IdSolicitudServicio = ?',
-      [id]
-    );
-
-    res.status(200).json({
-      success: true,
-      message: 'Notificación marcada como vista.'
-    });
-  } catch (error) {
-    console.error('❌ Error al marcar notificación como vista:', error);
-    res.status(500).json({ success: false, message: 'Error interno del servidor.' });
-  }
-});
-
-//MARKETPLACE DE GRUAS - SOLO VISUALIZACION DE USUARIO NATURAL//
-
-app.get("/api/marketplace-gruas", async (req, res) => {
-  try {
-    console.log('📥 GET /api/marketplace-gruas');
-    const [publicaciones] = await pool.query(
-      `SELECT 
-         pg.IdPublicacionGrua,
-         pg.TituloPublicacion,
-         pg.DescripcionServicio,
-         pg.ZonaCobertura,
-         pg.FotoPublicacion,
-         ps.Usuario
-       FROM publicaciongrua pg
-       JOIN prestadorservicio ps ON pg.Servicio = ps.IdServicio
-       ORDER BY pg.IdPublicacionGrua DESC`
-    );
-    console.log(`✅ Encontradas ${publicaciones.length} grúas`);
-
-    res.json(publicaciones);
-  } catch (err) {
-    console.error("❌ Error al obtener publicaciones:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-///DETALLE O VISUALIZACION DE EL DETALLE DE LA PUBLICACION DE GRUAS/// 
-// 🔹 DETALLE PÚBLICO DE PUBLICACIÓN DE GRÚA (para usuarios naturales)
-app.get("/api/publicaciones-grua/:id", async (req, res) => {
-  const { id } = req.params;
-  console.log("📥 Solicitud recibida con ID:", id);
-
-  try {
-    const rows = await queryPromise(
-      `SELECT 
-         pg.IdPublicacionGrua,
-         pg.TituloPublicacion,
-         pg.DescripcionServicio,
-         pg.ZonaCobertura,
-         pg.TarifaBase,
-         pg.FotoPublicacion,
-         ps.Usuario AS IdUsuario,
-         u.Nombre AS NombrePrestador,
-         u.Telefono,
-         u.Correo
-       FROM publicaciongrua pg
-       JOIN prestadorservicio ps ON pg.Servicio = ps.IdServicio
-       JOIN usuario u ON ps.Usuario = u.IdUsuario
-       WHERE pg.IdPublicacionGrua = ?`,
-      [id]
-    );
-
-    console.log("📊 Resultado de la consulta:", rows);
-
-    if (rows.length === 0) {
-      console.warn("⚠️ No se encontró publicación para el ID:", id);
-      return res.status(404).json({ error: "Publicación no encontrada" });
-    }
-
-    res.json(rows[0]);
-  } catch (err) {
-    console.error("❌ Error al obtener publicación:", err);
-    res.status(500).json({ error: "Error interno del servidor" });
-  }
-});
-
-
-//opiniones grua //
-app.post('/api/opiniones-grua', async (req, res) => {
-  try {
-    const { usuarioId, idPublicacionGrua, nombreUsuario, comentario, calificacion } = req.body;
-
-    if (!usuarioId || !idPublicacionGrua || !comentario || !calificacion) {
-      return res.status(400).json({ error: 'Faltan datos obligatorios' });
-    }
-
-    const [resultado] = await pool.query(
-      `INSERT INTO OpinionesGrua (UsuarioNatural, PublicacionGrua, NombreUsuario, Comentario, Calificacion)
-       VALUES (?, ?, ?, ?, ?)`,
-      [usuarioId, idPublicacionGrua, nombreUsuario, comentario, calificacion]
-    );
-
-    res.json({
-      mensaje: '✅ Opinión guardada correctamente',
-      idOpinion: resultado.insertId
-    });
-  } catch (error) {
-    console.error('❌ Error al insertar opinión de grúa:', error);
-    res.status(500).json({ error: 'Error en el servidor al guardar la opinión.' });
-  }
-});
-
-app.get('/api/opiniones-grua/:idPublicacionGrua', async (req, res) => {
-  const { idPublicacionGrua } = req.params;
-
-  try {
-    const opiniones = await queryPromise(
-      `SELECT NombreUsuario, Comentario, Calificacion, Fecha
-       FROM opinionesgrua
-       WHERE PublicacionGrua = ?
-       ORDER BY Fecha DESC`,
-      [idPublicacionGrua]
-    );
-
-    res.json(opiniones);
-  } catch (error) {
-    console.error('❌ Error al obtener opiniones de grúa:', error);
-    res.status(500).json({ error: 'Error en el servidor al consultar opiniones.' });
-  }
-});
-
-// ===============================
-// 🔹 Agendar Servicio de Grúa
-// ===============================
-app.post('/api/agendar-grua', async (req, res) => {
-  try {
-    const { usuarioId, idPublicacionGrua, fecha, hora, direccion, destino, detalle } = req.body;
-
-    console.log("📅 Agendando servicio de grúa:", req.body);
-
-    if (!usuarioId || !idPublicacionGrua || !fecha || !hora || !direccion) {
-      return res.status(400).json({ error: 'Faltan datos obligatorios para agendar el servicio.' });
-    }
-
-    await queryPromise(
-      `INSERT INTO controlagendaservicios 
-       (UsuarioNatural, PublicacionGrua, FechaServicio, HoraServicio, DireccionRecogida, Destino, ComentariosAdicionales, Estado)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 'Pendiente')`,
-      [usuarioId, idPublicacionGrua, fecha, hora, direccion, destino || null, detalle || null]
-    );
-
-    console.log("✅ Servicio agendado correctamente");
-    res.json({ success: true, message: 'Servicio agendado con éxito.' });
-
-  } catch (error) {
-    console.error('❌ Error al agendar servicio de grúa:', error);
-    res.status(500).json({ error: 'Error en el servidor al agendar el servicio.' });
-  }
-});
-
-// ===============================
-// 🔹 Historial de Servicios del Prestador
-// ===============================
-app.get('/api/historial-servicios-prestador/:usuarioId', async (req, res) => {
-  const { usuarioId } = req.params;
-
-  try {
-    console.log("📊 Cargando historial de servicios para prestador:", usuarioId);
-
-    // Obtener el IdServicio del prestador
-    const servicioRows = await queryPromise(
-      'SELECT IdServicio FROM prestadorservicio WHERE Usuario = ?',
-      [usuarioId]
-    );
-
-    if (servicioRows.length === 0) {
-      console.log("⚠️ No se encontró servicio asociado al prestador");
-      return res.json([]);
-    }
-
-    const idServicio = servicioRows[0].IdServicio;
-
-    // Obtener todos los servicios agendados
-    const servicios = await queryPromise(
-      `SELECT 
-         cas.IdSolicitudServicio,
-         u.Nombre AS Cliente,
-         pg.TituloPublicacion AS Servicio,
-         cas.DireccionRecogida AS Origen,
-         cas.Destino,
-         cas.FechaServicio AS Fecha,
-         cas.HoraServicio AS Hora,
-         cas.Estado,
-         cas.FechaModificadaPor,
-         cas.NotificacionVista
-       FROM controlagendaservicios cas
-       JOIN publicaciongrua pg ON cas.PublicacionGrua = pg.IdPublicacionGrua
-       JOIN usuario u ON cas.UsuarioNatural = u.IdUsuario
-       WHERE pg.Servicio = ?
-       ORDER BY cas.FechaServicio DESC`,
-      [idServicio]
-    );
-
-    console.log(`✅ ${servicios.length} servicios encontrados`);
-    res.json(servicios);
-
-  } catch (error) {
-    console.error('❌ Error al obtener historial de servicios:', error);
-    res.status(500).json({ error: 'Error en el servidor al consultar historial.' });
-  }
-});
-
-
-//----------///
-// SECCION DE ADMINISTRADOR //
-//-----------//
-
-// Middleware para verificar si es administrador
-function verificarAdmin(req, res, next) {
-  const usuarioSesion = req.session.usuario;
-  console.log('🔐 Verificando admin - Usuario en sesión:', usuarioSesion);
-  console.log('🔐 Tipo de usuario:', usuarioSesion?.tipo);
-  
-  if (!usuarioSesion || usuarioSesion.tipo !== "Administrador") {
-    console.error('❌ Acceso denegado - No es administrador');
-    return res.status(403).json({ error: "Acceso denegado. Solo administradores." });
-  }
-  
-  console.log('✅ Administrador verificado');
-  next();
-}
+// ----------
+// ADMINISTRADOR
+// ----------
 
 // ===============================
 // Obtener estadísticas del panel de admin
@@ -5506,9 +3844,9 @@ app.delete('/api/admin/usuario/:id', verificarAdmin, async (req, res) => {
     
     // 10. Eliminar solicitudes de servicio del usuario natural (como cliente)
     try {
-      const solicitudesUsuario = await queryPromise('SELECT IdSolicitudServicio FROM controlagendaservicios WHERE UsuarioNatural = ?', [id]);
-      if (solicitudesUsuario.length > 0) {
-        const solIds = solicitudesUsuario.map(s => s.IdSolicitudServicio);
+      const solicitudes = await queryPromise('SELECT IdSolicitudServicio FROM controlagendaservicios WHERE UsuarioNatural = ?', [id]);
+      if (solicitudes.length > 0) {
+        const solIds = solicitudes.map(s => s.IdSolicitudServicio);
         const placeholders = solIds.map(() => '?').join(',');
         await eliminarSeguro(
           `DELETE FROM historialservicios WHERE SolicitudServicio IN (${placeholders})`,
@@ -5550,15 +3888,15 @@ app.delete('/api/admin/usuario/:id', verificarAdmin, async (req, res) => {
         }
         
         await eliminarSeguro(
-          `DELETE FROM detallefacturacomercio WHERE Factura IN (${placeholders})`,
-          facturaIds,
-          'Detalles factura comercio eliminados'
-        );
-        
-        await eliminarSeguro(
           `DELETE FROM detallefactura WHERE Factura IN (${placeholders})`,
           facturaIds,
           'Detalles factura eliminados'
+        );
+        
+        await eliminarSeguro(
+          `DELETE FROM detallefacturacomercio WHERE Factura IN (${placeholders})`,
+          facturaIds,
+          'Detalles factura comercio eliminados'
         );
       }
     } catch (error) {
@@ -5762,7 +4100,7 @@ app.delete('/api/admin/publicacion/:id', verificarAdmin, async (req, res) => {
               body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
               .container { max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
               .header { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
-              .content { background: white; padding: 30px; }
+              .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
               .footer { background: #333; color: white; padding: 20px; text-align: center; border-radius: 0 0 10px 10px; font-size: 12px; }
               .alert-box { background: #ffe6e6; border-left: 4px solid #e74c3c; padding: 15px; margin: 20px 0; border-radius: 5px; }
               .product-info { background: #f8f9fa; padding: 15px; border-radius: 5px; margin: 20px 0; }
@@ -5772,7 +4110,7 @@ app.delete('/api/admin/publicacion/:id', verificarAdmin, async (req, res) => {
           <body>
             <div class="container">
               <div class="header">
-                <h1>⚠️ Publicación Eliminada</h1>
+                <h1>⚠️ Hemos Respondido tu Solicitud</h1>
               </div>
               <div class="content">
                 <p>Hola <strong>${nombreUsuario} ${apellidoUsuario}</strong>,</p>
@@ -5919,10 +4257,10 @@ app.post('/api/admin/pqr/responder', verificarAdmin, async (req, res) => {
             <head>
               <style>
                 body { font-family: Arial, sans-serif; line-height: 1.6; color: #333; }
-                .container { max-width: 600px; margin: 0 auto; padding: 20px; }
-                .header { background: linear-gradient(135deg, #667eea 0%, #764ba2 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
-                .content { background: #f9f9f9; padding: 30px; border-left: 4px solid #667eea; }
-                .footer { background: #333; color: white; padding: 20px; text-align: center; border-radius: 0 0 10px 10px; }
+                .container { max-width: 600px; margin: 0 auto; padding: 20px; background-color: #f5f5f5; }
+                .header { background: linear-gradient(135deg, #e74c3c 0%, #c0392b 100%); color: white; padding: 30px; text-align: center; border-radius: 10px 10px 0 0; }
+                .content { background: #f9f9f9; padding: 30px; border-radius: 0 0 10px 10px; }
+                .footer { background: #333; color: white; padding: 20px; text-align: center; border-radius: 0 0 10px 10px; font-size: 12px; }
                 .badge { display: inline-block; padding: 5px 10px; border-radius: 5px; font-size: 12px; font-weight: bold; }
                 .badge-queja { background: #dc3545; color: white; }
                 .badge-reclamo { background: #ffc107; color: #333; }
@@ -5982,5 +4320,146 @@ app.post('/api/admin/pqr/responder', verificarAdmin, async (req, res) => {
   } catch (error) {
     console.error('❌ Error al responder PQR:', error);
     res.status(500).json({ error: 'Error en el servidor al responder PQR.' });
+  }
+});
+
+// ===============================
+// 🧩 DEBUG: Comprobar estado del prestador por correo
+// ===============================
+app.get('/api/debug/prestador-check', async (req, res) => {
+  const correo = req.query.correo;
+  if (!correo) return res.status(400).json({ error: 'Se requiere query param `correo`' });
+
+  try {
+    const users = await queryPromise('SELECT IdUsuario, Nombre, Apellido, TipoUsuario FROM usuario WHERE Correo = ?', [correo]);
+    if (!users || users.length === 0) return res.json({ found: false, message: 'Usuario no encontrado' });
+
+    const user = users[0];
+
+    const prest = await queryPromise('SELECT IdServicio FROM prestadorservicio WHERE Usuario = ? LIMIT 1', [user.IdUsuario]);
+    const prestExists = prest && prest.length > 0;
+    const idServicio = prestExists ? prest[0].IdServicio : null;
+
+    let publicaciones = [];
+    if (idServicio) {
+      publicaciones = await queryPromise('SELECT IdPublicacionGrua FROM publicaciongrua WHERE Servicio = ?', [idServicio]);
+    }
+
+    const pubIds = publicaciones.map(p => p.IdPublicacionGrua);
+
+    let agendaCount = 0;
+    let opinionesCount = 0;
+
+    if (pubIds.length > 0) {
+      const placeholders = pubIds.map(() => '?').join(',');
+      const [agendaRows] = await pool.query(`SELECT COUNT(*) as cnt FROM controlagendaservicios WHERE PublicacionGrua IN (${placeholders})`, pubIds);
+      const [opinionesRows] = await pool.query(`SELECT COUNT(*) as cnt FROM OpinionesGrua WHERE PublicacionGrua IN (${placeholders})`, pubIds);
+      agendaCount = agendaRows[0].cnt;
+      opinionesCount = opinionesRows[0].cnt;
+    }
+
+    res.json({
+      found: true,
+      usuario: user,
+      prestador: { exists: prestExists, IdServicio: idServicio },
+      publicaciongrua: { total: publicaciones.length, ids: pubIds },
+      controlagendaservicios: { total: agendaCount },
+      opinionesgrua: { total: opinionesCount }
+    });
+  } catch (err) {
+    console.error('❌ Error en /api/debug/prestador-check:', err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ===============================
+// 🛠️ DEBUG: Crear/asegurar datos mínimos para un prestador existente
+// - Solo crea `prestadorservicio` y una `publicaciongrua` si faltan.
+// - Crea agenda/opinion de ejemplo solo si existe un usuario Natural en la BD.
+// ===============================
+app.post('/api/debug/prestador-ensure', async (req, res) => {
+  const correo = req.body && req.body.correo;
+  if (!correo) return res.status(400).json({ error: 'Se requiere body `correo`' });
+
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+
+    const [users] = await conn.query('SELECT IdUsuario FROM usuario WHERE Correo = ?', [correo]);
+    if (!users || users.length === 0) {
+      await conn.rollback();
+      return res.status(404).json({ error: 'Usuario no encontrado. Cree primero el usuario con ese correo.' });
+    }
+
+    const idUsuario = users[0].IdUsuario;
+
+    // 1) Asegurar prestadorservicio
+    const [prestRows] = await conn.query('SELECT IdServicio FROM prestadorservicio WHERE Usuario = ? LIMIT 1', [idUsuario]);
+    let idServicio;
+    if (prestRows.length === 0) {
+      const [insertPrest] = await conn.query(
+        `INSERT INTO prestadorservicio (Usuario, Direccion, Barrio, Certificado, DiasAtencion, HoraInicio, HoraFin)
+         VALUES (?, ?, ?, ?, ?, '08:00:00', '18:00:00')`,
+        [idUsuario, 'Sin dirección', 'Sin barrio', 'certificado-placeholder.jpg', 'L-V']
+      );
+      idServicio = insertPrest.insertId;
+    } else {
+      idServicio = prestRows[0].IdServicio;
+    }
+
+    // 2) Asegurar al menos una publicaciongrua
+    const [pubRows] = await conn.query('SELECT IdPublicacionGrua FROM publicaciongrua WHERE Servicio = ? LIMIT 1', [idServicio]);
+    let idPublicacionGrua;
+    if (pubRows.length === 0) {
+      const [insertPub] = await conn.query(
+        `INSERT INTO publicaciongrua (Servicio, DescripcionServicio, TarifaBase, ZonaCobertura, FotoPublicacion, TituloPublicacion)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [idServicio, 'Publicación de prueba generada por debug', 50000, 'Cobertura local', '/imagen/default_grua.jpg', 'Grúa de prueba']
+      );
+      idPublicacionGrua = insertPub.insertId;
+    } else {
+      idPublicacionGrua = pubRows[0].IdPublicacionGrua;
+    }
+
+    // 3) Insertar agenda y opinión de ejemplo si existe un usuario Natural
+    const [naturalRows] = await conn.query("SELECT IdUsuario FROM usuario WHERE TipoUsuario = 'Natural' LIMIT 1");
+    let createdAgenda = false;
+    let createdOpinion = false;
+    if (naturalRows.length > 0) {
+      const usuarioNatural = naturalRows[0].IdUsuario;
+
+      const [agendaExists] = await conn.query('SELECT IdSolicitudServicio FROM controlagendaservicios WHERE PublicacionGrua = ? LIMIT 1', [idPublicacionGrua]);
+      if (agendaExists.length === 0) {
+        await conn.query(`INSERT INTO controlagendaservicios (UsuarioNatural, PublicacionGrua, FechaServicio, HoraServicio, DireccionRecogida, Destino, ComentariosAdicionales, Estado)
+                          VALUES (?, ?, CURDATE(), '09:00:00', 'Direccion prueba', 'Destino prueba', 'Comentario de prueba', 'Pendiente')`,
+                          [usuarioNatural, idPublicacionGrua]);
+        createdAgenda = true;
+      }
+
+      const [opExists] = await conn.query('SELECT IdOpinion FROM OpinionesGrua WHERE PublicacionGrua = ? LIMIT 1', [idPublicacionGrua]);
+      if (opExists.length === 0) {
+        await conn.query(`INSERT INTO OpinionesGrua (UsuarioNatural, PublicacionGrua, NombreUsuario, Comentario, Calificacion)
+                          VALUES (?, ?, ?, ?, ?)`,
+                          [usuarioNatural, idPublicacionGrua, 'UsuarioPrueba', 'Excelente servicio', 5]);
+        createdOpinion = true;
+      }
+    }
+
+    await conn.commit();
+
+    res.json({
+      success: true,
+      usuarioId: idUsuario,
+      prestador: { IdServicio: idServicio },
+      publicaciongrua: { IdPublicacionGrua: idPublicacionGrua },
+      createdAgenda,
+      createdOpinion
+    });
+  } catch (err) {
+    await conn.rollback();
+    console.error('❌ Error en /api/debug/prestador-ensure:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    conn.release();
   }
 });

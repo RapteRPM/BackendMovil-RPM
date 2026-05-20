@@ -51,7 +51,7 @@ Edita el archivo `.env` con tus credenciales:
 DB_HOST=localhost
 DB_USER=root
 DB_PASSWORD=tu_contraseña
-DB_NAME=rpm_market
+DB_NAME=rpmmarket
 DB_PORT=3306
 
 # Email
@@ -77,7 +77,7 @@ TRUST_PROXY=false
 
 ### 4️⃣ Importar base de datos
 ```bash
-mysql -u root -p rpm_market < rpm_market.sql
+mysql -u root -p rpmmarket < rpm_market.sql
 ```
 
 ### 5️⃣ Iniciar el servidor
@@ -295,7 +295,7 @@ curl http://localhost:3000/api/verificar-sesion -b cookies.txt
    DB_HOST=tu_host_mysql
    DB_USER=tu_usuario
    DB_PASSWORD=tu_password
-   DB_NAME=rpm_market
+  DB_NAME=rpmmarket
    SESSION_SECRET=secreto_produccion
    EMAIL_USER=rpmservice2026@gmail.com
    EMAIL_PASS=password_aplicacion

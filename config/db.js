@@ -126,7 +126,7 @@ try {
     host: process.env.DB_HOST || process.env.MYSQL_HOST || 'localhost',
     user: process.env.DB_USER || process.env.MYSQL_USER || 'root',
     password: process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || 'root',
-    database: process.env.DB_NAME || process.env.MYSQL_DATABASE || 'rpm_market',
+    database: process.env.DB_NAME || process.env.MYSQL_DATABASE || 'rpmmarket',
     port: process.env.DB_PORT || process.env.MYSQL_PORT || 3306,
     waitForConnections: true,
     connectionLimit: 10,
@@ -155,9 +155,10 @@ try {
   // Crear base de datos SQLite
   try {
     const SQLiteDatabase = await cargarDatabaseSQLite();
-    const dbPath = path.join(__dirname, '../rpm_market.db');
+    // Usa la variable SQLITE_DB_PATH si existe, de lo contrario la guarda en C:\Proyecto final\DB\rpm_market.db o en la ruta original si prefieres relativas
+    const dbPath = process.env.SQLITE_DB_PATH || path.join('C:', 'Proyecto final', 'DB', 'rpm_market.db');
     sqliteDb = new SQLiteDatabase(dbPath);
-    console.log('✅ Base de datos SQLite creada en:', dbPath);
+    console.log('✅ Base de datos SQLite inicializada en:', dbPath);
   } catch (sqliteLoadErr) {
     console.error('❌ No se pudo cargar better-sqlite3 para el fallback SQLite:', sqliteLoadErr.message);
     throw new Error('No se pudo iniciar MySQL ni SQLite. Revisa la conexión a MySQL o reinstala better-sqlite3.');
@@ -165,7 +166,9 @@ try {
   
   // Leer y ejecutar el script SQL si la BD está vacía
   try {
-    const sqlScript = fs.readFileSync(path.join(__dirname, '../rpm_market.sql'), 'utf-8');
+    // Usamos el .sql que se encuentra en C:\Proyecto final\DB\rpm_market.sql
+    const sqlPath = path.join('C:', 'Proyecto final', 'DB', 'rpm_market.sql');
+    const sqlScript = fs.readFileSync(sqlPath, 'utf-8');
     
     // Adaptar SQL de MySQL a SQLite
     const sqliteScript = sqlScript
