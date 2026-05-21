@@ -738,8 +738,8 @@ app.get('/api/dashboard', verificarSesion, async (req, res) => {
       const completedRows = await queryPromise(completedQuery, paramsBase.slice(0, servicioIds.length + (from && to ? 2 : 0)));
       const completed = completedRows && completedRows.length ? completedRows[0].completed : 0;
 
-      // Valoración promedio (OpinionesGrua.Calificacion)
-      const ratingQuery = `SELECT AVG(og.Calificacion) AS rating FROM OpinionesGrua og INNER JOIN publicaciongrua pg ON og.PublicacionGrua = pg.IdPublicacionGrua WHERE pg.Servicio IN (${placeholders})`;
+      // Valoración promedio (opinionesgrua.Calificacion)
+      const ratingQuery = `SELECT AVG(og.Calificacion) AS rating FROM opinionesgrua og INNER JOIN publicaciongrua pg ON og.PublicacionGrua = pg.IdPublicacionGrua WHERE pg.Servicio IN (${placeholders})`;
       const ratingRows = await queryPromise(ratingQuery, servicioIds);
       const rating = ratingRows && ratingRows.length && ratingRows[0].rating ? Number(parseFloat(ratingRows[0].rating).toFixed(1)) : 0.0;
 
@@ -1899,7 +1899,7 @@ app.delete('/api/publicaciongrua/:id', async (req, res) => {
     await pool.query('DELETE FROM controlagendaservicios WHERE PublicacionGrua = ?', [idPublicacion]);
 
     // Eliminar opiniones
-    await pool.query('DELETE FROM OpinionesGrua WHERE PublicacionGrua = ?', [idPublicacion]);
+    await pool.query('DELETE FROM opinionesgrua WHERE PublicacionGrua = ?', [idPublicacion]);
 
     // Eliminar publicación
     await pool.query('DELETE FROM publicaciongrua WHERE IdPublicacionGrua = ? AND Servicio = ?', [idPublicacion, idServicio]);
@@ -2122,7 +2122,7 @@ app.get('/api/opinionesgrua', async (req, res) => {
         pg.TarifaBase,
         CONCAT(COALESCE(u.Nombre, ''), ' ', COALESCE(u.Apellido, '')) AS NombreCompleto,
         u.FotoPerfil
-      FROM OpinionesGrua og
+      FROM opinionesgrua og
       INNER JOIN publicaciongrua pg ON pg.IdPublicacionGrua = og.PublicacionGrua
       LEFT JOIN usuario u ON u.IdUsuario = og.UsuarioNatural
       WHERE 1 = 1
@@ -2170,7 +2170,7 @@ app.get('/api/publicaciones-con-opiniones', async (req, res) => {
     const ids = publicaciones.map(p => p.id);
     let opiniones = [];
     if (ids.length > 0) {
-      const q = `SELECT * FROM OpinionesGrua WHERE PublicacionGrua IN (${ids.join(',')}) ORDER BY Fecha DESC`;
+      const q = `SELECT * FROM opinionesgrua WHERE PublicacionGrua IN (${ids.join(',')}) ORDER BY Fecha DESC`;
       opiniones = await queryPromise(q, []);
     }
 
@@ -3423,7 +3423,7 @@ app.get('/api/mis-publicaciones-grua', async (req, res) => {
     for (const pub of misGruas) {
       const [opiniones] = await pool.query(
         `SELECT IdOpinion, UsuarioNatural, NombreUsuario, Comentario, Calificacion, Fecha
-         FROM OpinionesGrua WHERE PublicacionGrua = ?
+         FROM opinionesgrua WHERE PublicacionGrua = ?
          ORDER BY Fecha DESC`,
         [pub.IdPublicacionGrua]
       );
@@ -3701,7 +3701,7 @@ app.delete('/api/admin/usuario/:id', verificarAdmin, async (req, res) => {
     await eliminarSeguro('DELETE FROM opiniones WHERE UsuarioNatural = ?', [id], 'Opiniones eliminadas');
     
     // 4. Eliminar opiniones sobre grúas del usuario
-    await eliminarSeguro('DELETE FROM OpinionesGrua WHERE UsuarioNatural = ?', [id], 'Opiniones grúas eliminadas');
+    await eliminarSeguro('DELETE FROM opinionesgrua WHERE UsuarioNatural = ?', [id], 'Opiniones grúas eliminadas');
     
     // 5. Eliminar PQRs
     await eliminarSeguro('DELETE FROM centroayuda WHERE Perfil = ?', [id], 'PQRs eliminadas');
@@ -3808,7 +3808,7 @@ app.delete('/api/admin/usuario/:id', verificarAdmin, async (req, res) => {
           
           // Eliminar opiniones sobre estas publicaciones de grúa
           await eliminarSeguro(
-            `DELETE FROM OpinionesGrua WHERE PublicacionGrua IN (${placeholders})`,
+            `DELETE FROM opinionesgrua WHERE PublicacionGrua IN (${placeholders})`,
             gruaIds,
             'Opiniones de grúas eliminadas'
           );
@@ -4029,8 +4029,8 @@ app.delete('/api/admin/publicacion/:id', verificarAdmin, async (req, res) => {
       // Eliminar solicitudes relacionadas
       await queryPromise('DELETE FROM controlagendaservicios WHERE PublicacionGrua = ?', [id]);
       
-      // Eliminar opiniones de grúa si existen (tabla OpinionesGrua)
-      await queryPromise('DELETE FROM OpinionesGrua WHERE PublicacionGrua = ?', [id]);
+      // Eliminar opiniones de grúa si existen (tabla opinionesgrua)
+      await queryPromise('DELETE FROM opinionesgrua WHERE PublicacionGrua = ?', [id]);
       
       // Eliminar la publicación de grúa
       await queryPromise('DELETE FROM publicaciongrua WHERE IdPublicacionGrua = ?', [id]);
@@ -4354,7 +4354,7 @@ app.get('/api/debug/prestador-check', async (req, res) => {
     if (pubIds.length > 0) {
       const placeholders = pubIds.map(() => '?').join(',');
       const [agendaRows] = await pool.query(`SELECT COUNT(*) as cnt FROM controlagendaservicios WHERE PublicacionGrua IN (${placeholders})`, pubIds);
-      const [opinionesRows] = await pool.query(`SELECT COUNT(*) as cnt FROM OpinionesGrua WHERE PublicacionGrua IN (${placeholders})`, pubIds);
+      const [opinionesRows] = await pool.query(`SELECT COUNT(*) as cnt FROM opinionesgrua WHERE PublicacionGrua IN (${placeholders})`, pubIds);
       agendaCount = agendaRows[0].cnt;
       opinionesCount = opinionesRows[0].cnt;
     }
@@ -4437,9 +4437,9 @@ app.post('/api/debug/prestador-ensure', async (req, res) => {
         createdAgenda = true;
       }
 
-      const [opExists] = await conn.query('SELECT IdOpinion FROM OpinionesGrua WHERE PublicacionGrua = ? LIMIT 1', [idPublicacionGrua]);
+      const [opExists] = await conn.query('SELECT IdOpinion FROM opinionesgrua WHERE PublicacionGrua = ? LIMIT 1', [idPublicacionGrua]);
       if (opExists.length === 0) {
-        await conn.query(`INSERT INTO OpinionesGrua (UsuarioNatural, PublicacionGrua, NombreUsuario, Comentario, Calificacion)
+        await conn.query(`INSERT INTO opinionesgrua (UsuarioNatural, PublicacionGrua, NombreUsuario, Comentario, Calificacion)
                           VALUES (?, ?, ?, ?, ?)`,
                           [usuarioNatural, idPublicacionGrua, 'UsuarioPrueba', 'Excelente servicio', 5]);
         createdOpinion = true;
