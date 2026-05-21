@@ -12,6 +12,54 @@ let sqliteDb = null;
 let mysqlPool = null;
 let Database = null;
 
+const readFirstEnv = (...names) => {
+  for (const name of names) {
+    const value = process.env[name];
+    if (value !== undefined && value !== '') {
+      return value;
+    }
+  }
+
+  return undefined;
+};
+
+const parseBooleanEnv = (value) => value === 'true' || value === '1';
+
+const buildMysqlConfig = () => {
+  const databaseUrl = readFirstEnv('DATABASE_URL', 'MYSQL_URL');
+
+  if (databaseUrl) {
+    const parsedUrl = new URL(databaseUrl);
+    const sslEnabled = parseBooleanEnv(process.env.DB_SSL) || parseBooleanEnv(process.env.MYSQL_SSL) || parsedUrl.searchParams.get('ssl') === 'true';
+
+    return {
+      host: parsedUrl.hostname,
+      user: decodeURIComponent(parsedUrl.username || 'root'),
+      password: decodeURIComponent(parsedUrl.password || ''),
+      database: parsedUrl.pathname.replace(/^\//, '') || 'rpmmarket',
+      port: parsedUrl.port ? Number(parsedUrl.port) : 3306,
+      waitForConnections: true,
+      connectionLimit: 10,
+      queueLimit: 0,
+      ssl: sslEnabled ? { rejectUnauthorized: false } : undefined
+    };
+  }
+
+  const sslEnabled = parseBooleanEnv(process.env.DB_SSL) || parseBooleanEnv(process.env.MYSQL_SSL) || parseBooleanEnv(process.env.RAILWAY_ENVIRONMENT) || parseBooleanEnv(process.env.RAILWAY_MYSQL_SSL);
+
+  return {
+    host: readFirstEnv('DB_HOST', 'MYSQLHOST', 'MYSQL_HOST') || 'localhost',
+    user: readFirstEnv('DB_USER', 'MYSQLUSER', 'MYSQL_USER') || 'root',
+    password: readFirstEnv('DB_PASSWORD', 'MYSQLPASSWORD', 'MYSQL_PASSWORD') || 'root',
+    database: readFirstEnv('DB_NAME', 'MYSQLDATABASE', 'MYSQL_DATABASE') || 'rpmmarket',
+    port: Number(readFirstEnv('DB_PORT', 'MYSQLPORT', 'MYSQL_PORT') || 3306),
+    waitForConnections: true,
+    connectionLimit: 10,
+    queueLimit: 0,
+    ssl: sslEnabled ? { rejectUnauthorized: false } : undefined
+  };
+};
+
 // Detectar si estamos en modo desarrollo o producción
 const isProduction = process.env.NODE_ENV === 'production';
 const permitirSQLiteFallback = process.env.SQLITE_FALLBACK === 'true' || !isProduction;
@@ -122,16 +170,7 @@ const cargarDatabaseSQLite = async () => {
 
 // Intentar conectar a MySQL primero
 try {
-  mysqlPool = mysql.createPool({
-    host: process.env.DB_HOST || process.env.MYSQL_HOST || 'localhost',
-    user: process.env.DB_USER || process.env.MYSQL_USER || 'root',
-    password: process.env.DB_PASSWORD || process.env.MYSQL_PASSWORD || 'root',
-    database: process.env.DB_NAME || process.env.MYSQL_DATABASE || 'rpmmarket',
-    port: process.env.DB_PORT || process.env.MYSQL_PORT || 3306,
-    waitForConnections: true,
-    connectionLimit: 10,
-    queueLimit: 0
-  });
+  mysqlPool = mysql.createPool(buildMysqlConfig());
 
   const connection = await mysqlPool.getConnection();
   console.log('✅ Conectado a MySQL con ID ' + connection.threadId);
@@ -155,8 +194,8 @@ try {
   // Crear base de datos SQLite
   try {
     const SQLiteDatabase = await cargarDatabaseSQLite();
-    // Usa la variable SQLITE_DB_PATH si existe, de lo contrario la guarda en C:\Proyecto final\DB\rpm_market.db o en la ruta original si prefieres relativas
-    const dbPath = process.env.SQLITE_DB_PATH || path.join('C:', 'Proyecto final', 'DB', 'rpm_market.db');
+    const dbPath = process.env.SQLITE_DB_PATH || path.join(process.cwd(), 'data', 'rpm_market.db');
+    fs.mkdirSync(path.dirname(dbPath), { recursive: true });
     sqliteDb = new SQLiteDatabase(dbPath);
     console.log('✅ Base de datos SQLite inicializada en:', dbPath);
   } catch (sqliteLoadErr) {
@@ -166,8 +205,7 @@ try {
   
   // Leer y ejecutar el script SQL si la BD está vacía
   try {
-    // Usamos el .sql que se encuentra en C:\Proyecto final\DB\rpm_market.sql
-    const sqlPath = path.join('C:', 'Proyecto final', 'DB', 'rpm_market.sql');
+    const sqlPath = process.env.SQLITE_SCHEMA_PATH || path.join(process.cwd(), 'rpm_market.sql');
     const sqlScript = fs.readFileSync(sqlPath, 'utf-8');
     
     // Adaptar SQL de MySQL a SQLite

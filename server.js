@@ -26,6 +26,7 @@ const __dirname = dirname(__filename);
 const app = express();
 const port = process.env.PORT || 3000;
 const host = process.env.API_HOST || '0.0.0.0';
+const dbHost = process.env.DB_HOST || process.env.MYSQLHOST || process.env.MYSQL_HOST || 'localhost';
 
 const parseCsvEnv = (value, fallback = []) => {
   if (!value) return fallback;
@@ -165,7 +166,7 @@ app.get('/api/db-status', async (req, res) => {
     res.json({
       status: 'connected',
       database: process.env.DB_NAME || 'unknown',
-      host: process.env.DB_HOST || 'localhost',
+      host: dbHost,
       usuarios: rows[0].total,
       publicaciones: publicaciones[0].total,
       gruas: gruas[0].total
@@ -175,7 +176,7 @@ app.get('/api/db-status', async (req, res) => {
       status: 'error',
       message: err.message,
       database: process.env.DB_NAME || 'unknown',
-      host: process.env.DB_HOST || 'localhost'
+      host: dbHost
     });
   }
 });
